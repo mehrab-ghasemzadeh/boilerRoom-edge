@@ -1,0 +1,71 @@
+{
+  "units": {
+    "pot_1": {"name": "Pot 1"},
+    "pot_2": {"name": "Pot 2"}
+  },
+
+  "temperature_sensors": {
+    "1": {
+      "physical_id": "28-000000000001",
+      "role": "boiler_input_water",
+      "unit": "pot_1"
+    },
+    "2": {
+      "physical_id": "28-000000000002",
+      "role": "boiler_output_water",
+      "unit": "pot_1"
+    },
+    "3": {
+      "physical_id": "28-000000000003",
+      "role": "boiler_body",
+      "unit": "pot_1"
+    },
+    "4": {
+      "physical_id": "28-000000000004",
+      "role": "boiler_input_water",
+      "unit": "pot_2"
+    },
+    "5": {
+      "physical_id": "28-000000000005",
+      "role": "boiler_output_water",
+      "unit": "pot_2"
+    },
+    "6": {
+      "physical_id": "28-000000000006",
+      "role": "environment_outside"
+    },
+    "7": {
+      "physical_id": "28-000000000007",
+      "role": "environment_inside"
+    },
+    "8": {
+      "physical_id": "28-000000000008",
+      "role": "boiler_body",
+      "unit": "pot_2"
+    }
+  },
+
+  "gas_sensors": {
+    "1": {
+      "channel": 0,
+      "role": "boiler_room",
+      "unit": "pot_1"
+    },
+    "2": {
+      "channel": 1,
+      "role": "gas_valve",
+      "unit": "pot_1"
+    }
+  },
+
+  "relays": {
+    "1": {"gpio": 17, "role": "pot", "unit": "pot_1"},
+    "2": {"gpio": 18, "role": "pump", "unit": "pot_1"},
+    "3": {"gpio": 27, "role": "fan", "unit": "pot_1"},
+    "4": {"gpio": 22, "role": "torch", "unit": "pot_1"},
+    "5": {"gpio": 23, "role": "pot", "unit": "pot_2"},
+    "6": {"gpio": 24, "role": "pump", "unit": "pot_2"},
+    "7": {"gpio": 25, "role": "alarm"},
+    "8": {"gpio": 12, "role": "light"}
+  }
+}
