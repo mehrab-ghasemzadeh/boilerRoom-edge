@@ -9,6 +9,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
 
+def env_path(name: str, default: str | Path) -> Path:
+    """
+    Path from the environment, resolved against the project root when relative.
+
+    systemd starts services from ``/``, so a relative path like
+    ``data/readings.db`` would otherwise resolve to ``/data/readings.db``.
+    """
+    raw = os.environ.get(name) or str(default)
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else (PROJECT_ROOT / path)
+
+
 def load_dotenv(path: Path | None = None) -> None:
     env_path = path or DEFAULT_ENV_PATH
     if not env_path.exists():

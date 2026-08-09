@@ -8,12 +8,14 @@
     "1": {
       "physical_id": "28-000000000001",
       "role": "boiler_input_water",
-      "unit": "pot_1"
+      "unit": "pot_1",
+      "sensor_id": "inlet-1"
     },
     "2": {
       "physical_id": "28-000000000002",
       "role": "boiler_output_water",
-      "unit": "pot_1"
+      "unit": "pot_1",
+      "sensor_id": "outlet-1"
     },
     "3": {
       "physical_id": "28-000000000003",
@@ -36,7 +38,8 @@
     },
     "7": {
       "physical_id": "28-000000000007",
-      "role": "environment_inside"
+      "role": "environment_inside",
+      "sensor_id": "ambient-1"
     },
     "8": {
       "physical_id": "28-000000000008",

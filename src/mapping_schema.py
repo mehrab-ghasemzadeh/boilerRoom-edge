@@ -83,6 +83,19 @@ GAS_ROLE_LABELS = {
 }
 
 
+def api_sensor_id(kind: str, sensor_id: int, cfg: dict[str, Any]) -> str:
+    """
+    Identifier used when reporting a sensor to the server.
+
+    The platform knows sensors by the ``sensor_uid`` assigned at pairing time
+    (``inlet-1``, ``outlet-1``, ``ambient-1``). Where a mapping entry declares
+    that id, use it so readings and errors line up with the sensors the server
+    has on file. Probes with no server counterpart keep a local
+    ``temp-<n>`` / ``gas-<n>`` reference so their data is still reported.
+    """
+    return cfg.get("sensor_id") or f"{kind}-{sensor_id}"
+
+
 @dataclass(frozen=True)
 class DeviceMapping:
     units: dict[str, dict[str, str]]
@@ -125,6 +138,38 @@ def _parse_int_keys(section: dict[str, Any], section_name: str) -> dict[int, dic
     return result
 
 
+def _optional_sensor_uid(entry: dict[str, Any], field: str) -> str | None:
+    """The server-side sensor_uid for this probe, if the installation declares one."""
+    raw = entry.get("sensor_id")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{field}: 'sensor_id' must be a non-empty string")
+    return raw.strip()
+
+
+def _check_unique_sensor_ids(
+    temperature_sensors: dict[int, dict[str, Any]],
+    gas_sensors: dict[int, dict[str, Any]],
+) -> None:
+    """Two probes reporting the same sensor_uid would overwrite each other server-side."""
+    seen: dict[str, str] = {}
+    for section, sensors in (
+        ("temperature_sensors", temperature_sensors),
+        ("gas_sensors", gas_sensors),
+    ):
+        for sensor_id, cfg in sensors.items():
+            uid = cfg.get("sensor_id")
+            if not uid:
+                continue
+            where = f"{section}[{sensor_id}]"
+            if uid in seen:
+                raise ValueError(
+                    f"{where}: duplicate sensor_id {uid!r}, already used by {seen[uid]}"
+                )
+            seen[uid] = where
+
+
 def _validate_temperature_sensors(
     sensors: dict[int, dict[str, Any]],
     units: dict[str, dict[str, str]],
@@ -158,6 +203,7 @@ def _validate_temperature_sensors(
             "physical_id": physical_id,
             "role": role,
             "unit": unit,
+            "sensor_id": _optional_sensor_uid(entry, f"temperature_sensors[{sensor_id}]"),
             "name": _build_label(role, TEMPERATURE_ROLE_LABELS, units, unit),
         }
 
@@ -189,6 +235,7 @@ def _validate_gas_sensors(
             "channel": channel,
             "role": role,
             "unit": unit,
+            "sensor_id": _optional_sensor_uid(entry, f"gas_sensors[{sensor_id}]"),
             "name": _build_label(role, GAS_ROLE_LABELS, units, unit),
         }
 
@@ -244,6 +291,8 @@ def parse_mapping(raw: dict[str, Any]) -> DeviceMapping:
         _parse_int_keys(raw.get("relays", {}), "relays"),
         units,
     )
+
+    _check_unique_sensor_ids(temperature_sensors, gas_sensors)
 
     return DeviceMapping(
         units=units,

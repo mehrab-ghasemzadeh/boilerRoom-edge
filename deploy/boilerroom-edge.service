@@ -1,0 +1,50 @@
+[Unit]
+Description=Smart Boiler Room edge agent
+Documentation=https://git.mayanext.com/mehrab_ghw/boilerRoom-edge
+# The agent runs fine without a network — it falls back to its cached schedule
+# and retries login in the background — so this is a preference, not a hard
+# dependency. Nothing here should stop the boilers running their programme.
+After=network-online.target
+Wants=network-online.target
+
+# If it crashes 5 times in 5 minutes, stop trying — something is wrong that
+# restarting will not fix, and a tight loop on an SD card is its own problem.
+# These live in [Unit], not [Service]: systemd moved them in v229.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Adjust if the checkout or service account differs.
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/boilerRoom-edge
+ExecStart=/usr/bin/python3 /home/pi/boilerRoom-edge/src/main.py
+
+# GPIO, SPI and 1-Wire access without running as root.
+SupplementaryGroups=gpio spi i2c
+
+# No terminal under systemd: the control menu would read EOF on stdin, treat it
+# as "operator chose quit", and exit immediately — a restart loop. Setting this
+# explicitly rather than relying on the isatty() check.
+Environment=BOILERROOM_MENU=off
+StandardInput=null
+
+# The agent writes its own rotating log to data/boilerroom.log. Only the
+# startup banner reaches stdout, which the journal keeps.
+StandardOutput=journal
+StandardError=journal
+
+# SIGTERM is handled: relays are released and SQLite closed before exit.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

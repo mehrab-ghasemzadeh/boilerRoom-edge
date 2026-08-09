@@ -1,1 +1,5 @@
 websockets>=12.0
+
+# IANA timezone database for schedule evaluation (zoneinfo has no system tz db
+# on Windows; Linux/Raspberry Pi usually ships one, so this is a safe no-op).
+tzdata>=2024.1

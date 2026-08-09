@@ -9,21 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 from typing import Any, Awaitable, Callable
 
-from auth import DEVICE_ACCESS_TOKEN, DEVICE_ID, DEVICE_SERIAL, token_manager
+from auth import device_id as _device_id
+from auth import token_manager
 from config import TEMPERATURE_SENSORS
+from logging_setup import get_logger
+from mapping_schema import api_sensor_id
 
 LogFn = Callable[..., Awaitable[None]]
 
-
-def _device_id() -> str:
-    device_id = DEVICE_ID or DEVICE_SERIAL
-    if not device_id:
-        raise ValueError(
-            "BOILERROOM_DEVICE_ID or BOILERROOM_DEVICE_SERIAL must be set"
-        )
-    return device_id
+_log = get_logger("errors")
 
 
 def build_error(
@@ -51,12 +48,6 @@ def build_error(
 
 async def post_errors(errors: list[dict[str, Any]] | dict[str, Any]) -> dict[str, Any]:
     """POST one or more errors to the server."""
-    if not DEVICE_ACCESS_TOKEN:
-        raise ValueError(
-            "BOILERROOM_DEVICE_ACCESS_TOKEN is not set. "
-            "Provision the device and add the token to .env"
-        )
-
     body: dict[str, Any] | list[dict[str, Any]]
     if isinstance(errors, list):
         body = {"errors": errors}
@@ -64,7 +55,7 @@ async def post_errors(errors: list[dict[str, Any]] | dict[str, Any]) -> dict[str
         body = errors
 
     path = f"/api/v1/devices/{_device_id()}/errors"
-    return await token_manager.request_json_device("POST", path, body)
+    return await token_manager.request_json("POST", path, body)
 
 
 async def post_error(
@@ -95,13 +86,12 @@ def schedule_post_errors(
             if log:
                 await log(msg)
             else:
-                print(msg)
+                _log.info("Posted %d error(s) (code=%s)", count, preview)
         except Exception as exc:
-            msg = f"[errors] Failed to post: {exc}"
             if log:
-                await log(msg)
+                await log(f"[errors] Failed to post: {exc}", level=logging.WARNING)
             else:
-                print(msg)
+                _log.warning("Failed to post: %s", exc)
 
     return asyncio.create_task(_run())
 
@@ -150,7 +140,7 @@ class ErrorReporter:
                     message=f"{label} unavailable or read timeout",
                     severity="critical",
                     device_state="fault",
-                    sensor_id=f"temp-{sensor_id}",
+                    sensor_id=api_sensor_id("temp", sensor_id, cfg),
                     boiler_index=boiler_index,
                 ),
                 log=log,
