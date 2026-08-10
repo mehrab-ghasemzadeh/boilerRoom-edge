@@ -9,6 +9,11 @@ from typing import Any
 
 from logging_setup import get_logger, split_tag
 
+# Telemetry cadence used until the server pushes a config. Posting every sensor
+# cycle would be one upload every 10 s — far more than the platform asks for,
+# and needless radio time on a Pi Zero W.
+DEFAULT_TELEMETRY_INTERVAL_SECONDS = 60.0
+
 
 class RuntimeState:
     def __init__(self, read_interval: float = 10.0):
@@ -141,14 +146,20 @@ class RuntimeState:
         async with self._control_lock:
             return self.device_config
 
-    async def get_telemetry_interval(self) -> float | None:
-        """Server-requested telemetry cadence, or None to post every cycle."""
+    async def get_telemetry_interval(self) -> float:
+        """
+        Telemetry cadence in seconds.
+
+        The server's ``telemetry_interval_seconds`` wins when a config has been
+        pushed; otherwise the one-minute default applies. Never None — the
+        sensor loop always paces its uploads.
+        """
         async with self._control_lock:
             config = self.device_config
-        if config is None:
-            return None
         interval = getattr(config, "telemetry_interval_seconds", None)
-        return float(interval) if interval else None
+        if not interval:
+            return DEFAULT_TELEMETRY_INTERVAL_SECONDS
+        return float(interval)
 
     async def get_ws_status(self) -> dict[str, Any]:
         async with self._ws_lock:

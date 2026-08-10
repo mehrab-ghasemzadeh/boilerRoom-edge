@@ -188,6 +188,7 @@ async def _post_telemetry_now(state: RuntimeState) -> None:
 
 async def _show_app_config(state: RuntimeState) -> None:
     interval = await state.get_read_interval()
+    telemetry_interval = await state.get_telemetry_interval()
     mapping_path = Path(os.environ.get("BOILERROOM_MAPPING", DEFAULT_MAPPING_PATH))
     await state.echo("\n[menu] App configuration:")
     await state.echo(f"  API base URL:     {API_BASE_URL}")
@@ -196,6 +197,7 @@ async def _show_app_config(state: RuntimeState) -> None:
     await state.echo(f"  Device username:  {DEVICE_USERNAME or '(not set)'}")
     await state.echo(f"  Device ID:        {session.device_id if session else '(not logged in)'}")
     await state.echo(f"  Read interval:    {interval:.0f}s")
+    await state.echo(f"  Telemetry every:  {telemetry_interval:.0f}s")
     await state.echo(f"  Mapping source:   {os.environ.get('BOILERROOM_MAPPING_SOURCE', 'file')}")
     await state.echo(f"  Mapping file:     {mapping_path}")
     await state.echo(f"  Authenticated:    {token_manager.is_authenticated}")

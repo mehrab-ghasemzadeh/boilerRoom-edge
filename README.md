@@ -118,8 +118,19 @@ flowchart TD
 Limits are enforced *before* telemetry is built, so a cut is reported in the
 same cycle it happens.
 
-Telemetry cadence follows `telemetry_interval_seconds` from the server config
-(60 s) once one has been received. Without a config it posts every cycle.
+Telemetry is posted **once a minute**. `telemetry_interval_seconds` from the
+server config overrides that once one has been received; until then the
+one-minute default applies. Sensors are still read every `read_interval`
+(10 s) — the extra cycles feed the local database, the limit guard and the
+fault check, and only the upload is paced.
+
+The first cycle after boot posts immediately rather than waiting out the
+interval, so a restart is visible on the server straight away.
+
+The due-check runs on read-cycle boundaries, so a post lands on the first cycle
+*at or after* the minute mark — in practice 60–70 s apart, not exactly 60. The
+server records `captured_at` from the payload, so the spacing is recorded
+accurately rather than assumed.
 
 The envelope follows the schema in `DEVICE.md`: `sensor_readings` with
 `value`/`unit`/`status`, `boiler_states` and `pump_states` with `state` and

@@ -119,13 +119,14 @@ async def sensor_loop(state: RuntimeState) -> None:
             # the same cycle it happens.
             await limit_guard.check(state, temperatures)
 
-            # config.apply may ask for a slower cadence than the read interval;
-            # without it, post every cycle as before.
+            # Sensors are read far more often than telemetry is posted: one
+            # upload a minute by default, or whatever cadence config.apply asks
+            # for. The first cycle posts immediately so a fresh boot shows up
+            # on the server without waiting out the interval.
             telemetry_interval = await state.get_telemetry_interval()
             now = time.monotonic()
             due = (
                 last_telemetry_at is None
-                or telemetry_interval is None
                 or now - last_telemetry_at >= telemetry_interval
             )
 
