@@ -63,6 +63,7 @@ Five tasks run concurrently for the life of the process:
 | `schedule_loop` | Re-evaluate the active schedule every 20 s and switch relays |
 | `control_menu` | Interactive terminal menu for local inspection and control |
 | `auth_loop` | Obtain a device session, retrying in the background until it succeeds |
+| `device_record` | Poll `GET /devices/<id>` for calibration, sensor enable flags and cloud intent |
 
 ---
 
@@ -72,15 +73,15 @@ Five tasks run concurrently for the life of the process:
 flowchart TD
     A["python src/main.py"] --> B["load .env"]
     B --> C["load mapping.json<br/>validate roles, units, GPIO"]
-    C --> D["restore config_cache.json<br/>and schedule_cache.json"]
+    C --> D["restore device_record_cache.json,<br/>config_cache.json and schedule_cache.json"]
     D --> E["print startup banner"]
-    E --> F["start five asyncio tasks"]
+    E --> F["start six asyncio tasks"]
 
     F --> G["sensors, schedule and menu<br/>run immediately"]
     F --> H["auth_loop:<br/>POST /auth/device/login"]
     H -->|fails| I["retry: 10 s, doubling to 5 min<br/>device keeps running offline"]
     I --> H
-    H -->|token| J["telemetry and WebSocket<br/>start"]
+    H -->|token| J["telemetry, WebSocket and<br/>device record start"]
 ```
 
 **Startup never depends on the server being reachable.** Login runs as a
@@ -102,7 +103,8 @@ the agent simply logs in again.
 
 ```mermaid
 flowchart TD
-    A["read temperatures + gas<br/>concurrently"] --> B["store snapshot<br/>in RuntimeState"]
+    A["read temperatures + gas<br/>concurrently"] --> A2["apply calibration offsets<br/>from the device record"]
+    A2 --> B["store snapshot<br/>in RuntimeState"]
     B --> C["insert readings<br/>into SQLite"]
     C --> D{"any sensor<br/>unavailable?"}
     D -->|yes, and new| E["POST /devices/id/errors"]
@@ -316,6 +318,7 @@ git-ignored.
 | `BOILERROOM_MAPPING_URL` | — | Mapping URL when source is `server` (not implemented) |
 | `BOILERROOM_CONFIG_CACHE` | `config_cache.json` | Cached server config |
 | `BOILERROOM_SCHEDULE_CACHE` | `schedule_cache.json` | Cached server schedule |
+| `BOILERROOM_DEVICE_RECORD_CACHE` | `device_record_cache.json` | Cached device self-detail |
 | `BOILERROOM_DATABASE` | `data/readings.db` | Local reading history |
 | `BOILERROOM_DATA_RETENTION_DAYS` | `30` | Days of readings to keep (`0` = keep everything) |
 | `BOILERROOM_MENU` | auto | `on`/`off`; defaults to on only when stdin is a TTY |
@@ -464,6 +467,46 @@ ignored and the agent waits for a server push instead of failing to start.
 Reporting the cached versions in `device.hello` also stops the server
 re-pushing unchanged documents on every boot.
 
+### `device_record_cache.json` — the server's record of this device
+
+`GET /api/v1/devices/<id>` is the one REST endpoint a device token may *read*,
+and it returns the platform's own record of this device. It carries three
+things that arrive nowhere else — not in `config.apply`, not over the
+WebSocket:
+
+| From the record | What the agent does with it |
+|-----------------|------------------------------|
+| `sensors[].calibration.offset_c` | Added to each reading before anything consumes it |
+| `sensors[].enabled` | A disabled probe is excluded from telemetry |
+| `boiler_units[]` / `pump_units[]` `desired_*` vs `reported_*` | Logged as a divergence — never applied |
+| `capabilities` | Compared against what `device.hello` declared |
+
+Nothing pushes a calibration change, so the record is polled: once after login,
+then every 15 minutes, and on demand from the control menu. It is cached to
+disk on every successful fetch, so a device that boots during an outage still
+applies the right offsets instead of silently reporting uncorrected readings.
+
+**Calibration is applied at the top of the sensor cycle**, not at upload time.
+The corrected value is what goes into SQLite, what the limit guard judges, and
+what telemetry reports. Applying it only on the way out would leave the safety
+cut working from numbers that appear nowhere else.
+
+**A disabled sensor is still read, still stored, and still feeds the limit
+guard** — only telemetry drops it. Disabling a probe in the cloud is an
+instruction about reporting; letting it quietly remove a probe from the
+over-temperature cut would turn a display preference into a safety change.
+
+**Divergences are reported, not acted on.** The record shows what the cloud
+wants (`desired_state`, `desired_mode`) next to what we last told it. Acting on
+that here would race the command flow — the server re-dispatches queued
+commands after every hello — and could flip a boiler to `manual`, taking it off
+the schedule, without a command ever being issued. The agent logs the
+difference at WARNING and leaves the relays alone.
+
+The record is **not** a replacement for `mapping.json`. It has no 1-Wire ROM
+code, no GPIO pin and no SPI channel, so physical addressing stays local; the
+two are matched by `sensor_uid`.
+
 ---
 
 ## Running
@@ -528,6 +571,7 @@ card when the fault is something a restart cannot fix.
  3) Reload mapping from file  8) Report test error to server
  4) Change read interval      9) Show active schedule
  5) Relay status / control   10) Show recent log lines
+                             11) Show server device record
                               0) Quit
 ```
 
@@ -537,7 +581,10 @@ input is read in a worker thread.
 Option 5 marks any boiler held off by a temperature limit as `[CUT: reason]` and
 refuses to switch it on. Option 7 shows the active config, the limits, and which
 boilers are currently cut. Option 10 tails the log file without leaving the
-agent — useful over SSH on a headless Pi.
+agent — useful over SSH on a headless Pi. Option 11 shows the server's record of
+this device — calibration offsets, disabled probes, and where cloud intent
+differs from what was last reported — and offers to re-fetch it on the spot,
+which is the quickest way to confirm an installer's change has landed.
 
 ---
 
@@ -554,6 +601,7 @@ agent — useful over SSH on a headless Pi.
 | `json_store.py` | Atomic JSON read/write for the caches |
 | `logging_setup.py` | Queue-backed console and rotating file logging |
 | `device_config.py` | `config.apply` parsing and on-disk cache |
+| `device_record.py` | `GET /devices/<id>` parsing, calibration, cache, divergence reporting |
 | `telemetry_client.py` | Telemetry envelope construction and POST |
 | `errors_client.py` | Fault detection and error reporting |
 | `runtime_state.py` | Shared state across tasks, with locks |
@@ -573,7 +621,12 @@ Working: device login, telemetry, error reporting, device mapping, full
 WebSocket protocol (hello, heartbeat, config, schedule, commands), schedule-driven
 relay control, config and schedule caching, temperature limit enforcement,
 offline operation, SQLite reading history, rotating log files,
-systemd service.
+systemd service, device self-detail with sensor calibration.
+
+All four REST endpoints a device token may call are implemented:
+`POST /auth/device/login`, `POST /devices/<id>/telemetry`,
+`POST /devices/<id>/errors`, and `GET /devices/<id>`. The rest of the API
+requires a user JWT or an installer/admin role.
 
 Outstanding:
 

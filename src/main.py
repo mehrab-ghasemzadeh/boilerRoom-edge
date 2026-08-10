@@ -12,13 +12,23 @@ from config import load_device_mapping
 from control_menu import run_control_menu
 from data_logger import reading_store, save_readings
 from device_config import load_cached_config
+from device_record import (
+    DeviceRecordError,
+    apply_calibration,
+    capability_mismatches,
+    device_record_store,
+    divergences,
+    fetch_device_record,
+    load_cached_device_record,
+    save_cached_device_record,
+)
 from errors_client import error_reporter
 from limits_guard import limit_guard
 from logging_setup import configure_logging, shutdown_logging
 from runtime_state import RuntimeState
 from schedule_runner import load_cached_schedule, schedule_runner
 from telemetry_client import post_telemetry
-from ws_client import run_websocket_client
+from ws_client import CAPABILITIES, run_websocket_client
 
 # ----------------------------------------------------
 # Configuration
@@ -29,6 +39,11 @@ DEFAULT_READ_INTERVAL = 10
 
 # How often to re-check the active schedule for a state transition
 SCHEDULE_TICK_SECONDS = 20
+
+# How often to re-fetch the device's own record. Calibration and enable flags
+# change when an installer edits them, which is rare, and nothing pushes the
+# change — so poll, but gently.
+DEVICE_RECORD_REFRESH_SECONDS = 900
 
 # Login retry backoff, used when the server is unreachable at boot
 AUTH_RETRY_DELAY_SECONDS = 10
@@ -106,6 +121,10 @@ async def sensor_loop(state: RuntimeState) -> None:
                 temperature_reader.read_all(),
                 gas_reader.read_all(),
             )
+
+            # Correct readings before anything consumes them, so the database,
+            # the limit guard and telemetry all agree on the value.
+            temperatures = apply_calibration(temperatures)
 
             await state.update_readings(temperatures, gas)
             await save_readings(temperatures, gas)
@@ -243,6 +262,103 @@ async def restore_cached_schedule(state: RuntimeState) -> None:
     )
 
 
+async def restore_cached_device_record(state: RuntimeState) -> None:
+    """
+    Reload the last device record the server gave us.
+
+    Calibration offsets and sensor enable flags have to survive a reboot with
+    no network, or a device that comes up during an outage would silently
+    report uncalibrated readings — and feed them to the limit guard.
+    """
+    record, error = await load_cached_device_record()
+
+    if error:
+        await state.log(
+            f"[device] Ignoring unusable record cache ({error}) — will re-fetch",
+            level=logging.WARNING,
+        )
+        return
+    if record is None:
+        await state.log("[device] No cached device record — will fetch after login")
+        return
+
+    device_record_store.set_record(record)
+    await state.log(
+        f"[device] Restored cached record for {record.public_id} "
+        f"({len(record.sensors)} server sensor(s), "
+        f"{len(device_record_store.offsets)} calibration offset(s), "
+        f"{len(device_record_store.disabled)} disabled)"
+    )
+
+
+async def adopt_device_record(state: RuntimeState, record, payload) -> None:
+    """Make a freshly fetched record active, cache it, and report what it says."""
+    previous = device_record_store.record
+    device_record_store.set_record(record)
+    await save_cached_device_record(payload)
+
+    if previous is None or previous.fetched_at == "":
+        await state.log(
+            f"[device] Record for {record.public_id}: "
+            f"{len(record.sensors)} server sensor(s), "
+            f"{len(device_record_store.offsets)} calibration offset(s), "
+            f"{len(device_record_store.disabled)} disabled, "
+            f"{len(record.boiler_units)} boiler(s), {len(record.pump_units)} pump(s)"
+        )
+
+    for uid, offset in sorted(device_record_store.offsets.items()):
+        await state.log(f"[device] Calibration {uid}: {offset:+.2f} °C")
+    for uid in sorted(device_record_store.disabled):
+        await state.log(
+            f"[device] Sensor {uid} is disabled server-side — "
+            "excluded from telemetry, still used for safety limits",
+            level=logging.WARNING,
+        )
+
+    # Intent divergence is reported, never applied: the server re-dispatches
+    # queued commands after every hello, and acting here could flip a boiler to
+    # manual — off the schedule — without a command ever being issued.
+    for line in divergences(record):
+        await state.log(f"[device] Divergence — {line}", level=logging.WARNING)
+
+    for line in capability_mismatches(record, CAPABILITIES):
+        await state.log(f"[device] Capability mismatch — {line}", level=logging.WARNING)
+
+
+async def device_record_loop(state: RuntimeState) -> None:
+    """
+    Keep the device record fresh.
+
+    An installer can change calibration or disable a probe at any time, and
+    nothing pushes that over the WebSocket — it only appears in the record, so
+    it has to be polled. Slowly: it is a handful of fields that change rarely.
+    """
+    if not await state.wait_authenticated():
+        return
+
+    while not state.shutdown.is_set():
+        try:
+            record, payload = await fetch_device_record()
+        except DeviceRecordError as exc:
+            await state.log(
+                f"[device] Server record unusable: {exc}", level=logging.WARNING
+            )
+        except Exception as exc:
+            await state.log(
+                f"[device] Failed to fetch record: {exc}", level=logging.WARNING
+            )
+        else:
+            await adopt_device_record(state, record, payload)
+
+        try:
+            await asyncio.wait_for(
+                state.shutdown.wait(),
+                timeout=DEVICE_RECORD_REFRESH_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 async def restore_cached_config(state: RuntimeState) -> None:
     """
     Reload the last config the server pushed.
@@ -297,6 +413,7 @@ async def main() -> None:
     install_signal_handlers(state)
 
     await load_device_mapping()
+    await restore_cached_device_record(state)
     await restore_cached_config(state)
     await restore_cached_schedule(state)
     await print_startup_banner(state)
@@ -306,7 +423,8 @@ async def main() -> None:
     menu_task = asyncio.create_task(run_control_menu(state), name="control_menu")
     ws_task = asyncio.create_task(run_websocket_client(state), name="websocket_client")
     schedule_task = asyncio.create_task(schedule_loop(state), name="schedule_loop")
-    tasks = (auth_task, sensor_task, menu_task, ws_task, schedule_task)
+    record_task = asyncio.create_task(device_record_loop(state), name="device_record")
+    tasks = (auth_task, sensor_task, menu_task, ws_task, schedule_task, record_task)
 
     try:
         await asyncio.gather(*tasks)

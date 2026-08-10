@@ -20,6 +20,7 @@ from typing import Any
 from auth import device_id as _device_id
 from auth import token_manager
 from config import GAS_SENSORS, RELAYS, TEMPERATURE_SENSORS
+from device_record import device_record_store
 from mapping_schema import api_sensor_id
 from schedule_runner import Target
 from system_metrics import read_system_metrics, uptime_seconds
@@ -66,6 +67,7 @@ def _build_sensor_readings(
     gas: dict[int, int],
 ) -> list[dict[str, Any]]:
     readings: list[dict[str, Any]] = []
+    disabled = device_record_store.disabled
 
     for sensor_id, value in temperatures.items():
         cfg = TEMPERATURE_SENSORS.get(sensor_id, {})
@@ -73,8 +75,15 @@ def _build_sensor_readings(
         unit = cfg.get("unit")
         boiler_index = _unit_to_index(unit)
 
+        api_id = api_sensor_id("temp", sensor_id, cfg)
+        # A probe the operator disabled server-side is not reported. It keeps
+        # being read and stored locally, and the limit guard still sees it —
+        # disabling a probe must not quietly remove it from the safety cut.
+        if api_id in disabled:
+            continue
+
         entry: dict[str, Any] = {
-            "sensor_id": api_sensor_id("temp", sensor_id, cfg),
+            "sensor_id": api_id,
             "type": TEMPERATURE_ROLE_TO_API_TYPE.get(role, role),
             "unit": "C",
             "status": "ok" if value is not None else "unavailable",
@@ -97,8 +106,12 @@ def _build_sensor_readings(
         unit = cfg.get("unit")
         boiler_index = _unit_to_index(unit)
 
+        api_id = api_sensor_id("gas", sensor_id, cfg)
+        if api_id in disabled:
+            continue
+
         entry = {
-            "sensor_id": api_sensor_id("gas", sensor_id, cfg),
+            "sensor_id": api_id,
             "type": "gas",
             "value": value,
             "unit": "adc",

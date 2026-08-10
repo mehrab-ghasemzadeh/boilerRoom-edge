@@ -16,6 +16,12 @@ from auth import API_BASE_URL, DEVICE_USERNAME, WS_BASE_URL, token_manager
 from config import GAS_SENSORS, RELAYS, TEMPERATURE_SENSORS, UNITS, load_device_mapping
 from data_logger import reading_store
 from device_config import describe as describe_config
+from device_record import (
+    describe as describe_record,
+    device_record_store,
+    fetch_device_record,
+    save_cached_device_record,
+)
 from mapping_provider import DEFAULT_MAPPING_PATH
 from errors_client import build_error, schedule_post_errors
 from limits_guard import limit_guard
@@ -39,6 +45,7 @@ MENU = """
   8) Report test error to server
   9) Show active schedule
  10) Show recent log lines
+ 11) Show server device record
   0) Quit
 > """
 
@@ -282,6 +289,34 @@ async def _show_logs(state: RuntimeState) -> None:
     await state.echo("-" * 60 + "\n")
 
 
+async def _show_device_record(state: RuntimeState) -> None:
+    """Show the server's own record of this device, refreshing it on request."""
+    await state.echo("")
+    for line in describe_record(device_record_store.record):
+        await state.echo(f"  {line}")
+
+    answer = await _prompt("\n  Re-fetch from server? [y/N]: ")
+    if answer.strip().lower() not in ("y", "yes"):
+        await state.echo("")
+        return
+
+    await state.echo("  Fetching ...")
+    try:
+        record, payload = await fetch_device_record()
+    except Exception as exc:
+        await state.echo(f"  Fetch failed: {exc}\n")
+        return
+
+    device_record_store.set_record(record)
+    await save_cached_device_record(payload)
+    await state.log(f"[device] Record refreshed from the control menu ({record.public_id})")
+
+    await state.echo("")
+    for line in describe_record(record):
+        await state.echo(f"  {line}")
+    await state.echo("")
+
+
 async def _handle_choice(state: RuntimeState, choice: str) -> None:
     if choice == "1":
         await _show_last_readings(state)
@@ -303,6 +338,8 @@ async def _handle_choice(state: RuntimeState, choice: str) -> None:
         await _show_schedule(state)
     elif choice == "10":
         await _show_logs(state)
+    elif choice == "11":
+        await _show_device_record(state)
     elif choice == "0":
         await state.echo("\n[menu] Shutting down ...")
         state.shutdown.set()
