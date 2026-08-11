@@ -11,9 +11,9 @@ server tells us things it never pushes over the WebSocket:
 * ``capabilities`` — what the server believes this device can do, which is our
   own hello echoed back.
 
-It is *not* a replacement for mapping.json: the record carries no 1-Wire ROM
-code, GPIO pin or SPI channel, so physical addressing stays local. The record
-is matched onto the local mapping by ``sensor_uid``.
+The record also carries the wiring — ``physical_id``, ``channel``, ``gpio``
+and the boiler/pump each belongs to — so it is the device's only mapping
+source; see ``record_mapping.py`` for the conversion.
 
 The last successful fetch is cached to disk so calibration and enable flags
 survive a reboot with no network.
@@ -57,6 +57,23 @@ class ServerSensor:
     latest_value: float | None = None
     latest_status: str = ""
     latest_captured_at: str = ""
+    # Wiring: what makes the record usable as a mapping source.
+    config_key: str = ""
+    physical_id: str = ""
+    channel: int | None = None
+    boiler_unit: int | None = None
+
+
+@dataclass(frozen=True)
+class ServerRelay:
+    """A relay as the platform has it on file."""
+
+    relay_key: str = ""
+    gpio: int | None = None
+    role: str = ""
+    boiler_unit: int | None = None
+    pump_unit: int | None = None
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,9 @@ class ServerUnit:
 
     kind: str  # "boiler" or "pump"
     index: int
+    # The platform's primary key. Sensors and relays reference a unit by this,
+    # *not* by index — the two differ (a pump can be id 4, index 2).
+    unit_id: int | None = None
     name: str = ""
     enabled: bool = True
     desired_state: str = ""
@@ -109,6 +129,7 @@ class DeviceRecord:
     supports_config_push: bool = False
     paired_at: str = ""
     sensors: tuple[ServerSensor, ...] = ()
+    relays: tuple[ServerRelay, ...] = ()
     boiler_units: tuple[ServerUnit, ...] = ()
     pump_units: tuple[ServerUnit, ...] = ()
     fetched_at: str = ""
@@ -178,7 +199,37 @@ def _parse_sensor(entry: Any, position: int) -> ServerSensor | None:
         latest_value=_optional_float(entry.get("latest_value"), f"{where}.latest_value"),
         latest_status=str(entry.get("latest_status") or ""),
         latest_captured_at=str(entry.get("latest_captured_at") or ""),
+        config_key=str(entry.get("config_key") or ""),
+        physical_id=str(entry.get("physical_id") or ""),
+        channel=_optional_int(entry.get("channel"), f"{where}.channel"),
+        boiler_unit=_optional_int(entry.get("boiler_unit"), f"{where}.boiler_unit"),
     )
+
+
+def _parse_relays(raw: Any) -> tuple[ServerRelay, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise DeviceRecordError("'relays' must be a list")
+
+    relays: list[ServerRelay] = []
+    for position, entry in enumerate(raw):
+        where = f"relays[{position}]"
+        if not isinstance(entry, dict):
+            raise DeviceRecordError(f"{where}: expected an object")
+
+        relays.append(
+            ServerRelay(
+                relay_key=str(entry.get("relay_key") or ""),
+                gpio=_optional_int(entry.get("gpio"), f"{where}.gpio"),
+                role=str(entry.get("role") or ""),
+                boiler_unit=_optional_int(entry.get("boiler_unit"), f"{where}.boiler_unit"),
+                pump_unit=_optional_int(entry.get("pump_unit"), f"{where}.pump_unit"),
+                enabled=bool(entry.get("enabled", True)),
+            )
+        )
+
+    return tuple(relays)
 
 
 def _parse_units(raw: Any, kind: str) -> tuple[ServerUnit, ...]:
@@ -203,6 +254,7 @@ def _parse_units(raw: Any, kind: str) -> tuple[ServerUnit, ...]:
             ServerUnit(
                 kind=kind,
                 index=index,
+                unit_id=_optional_int(entry.get("id"), f"{where}.id"),
                 name=str(entry.get("name") or ""),
                 enabled=bool(entry.get("enabled", True)),
                 desired_state=str(entry.get("desired_state") or ""),
@@ -262,6 +314,7 @@ def parse_device_record(payload: dict[str, Any]) -> DeviceRecord:
         supports_config_push=bool(capabilities.get("supports_config_push", False)),
         paired_at=str(payload.get("paired_at") or ""),
         sensors=tuple(sensors),
+        relays=_parse_relays(payload.get("relays")),
         boiler_units=_parse_units(payload.get("boiler_units"), "boiler"),
         pump_units=_parse_units(payload.get("pump_units"), "pump"),
         fetched_at=_utc_now_iso(),

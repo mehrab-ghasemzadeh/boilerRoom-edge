@@ -18,6 +18,7 @@ from collections import OrderedDict
 from typing import Any, NamedTuple
 
 from config import RELAYS
+from device_config import config_store
 from schedule_runner import Target, relay_for_target, schedule_runner
 
 # How many command outcomes to remember for replay on re-dispatch.
@@ -98,6 +99,12 @@ async def _switch_target(
     else:
         await relay_controller.turn_off(relay_id)
 
+    # command.result carries reported_state, but DEVICE.md has telemetry as
+    # what actually settles a unit's stored state, so post that too.
+    await state.notify_state_change(
+        f"relay {relay_id} {'on' if turn_on else 'off'} (command)"
+    )
+
     return CommandOutcome(
         STATUS_EXECUTED,
         reported_state={index_key: index, "state": "on" if turn_on else "off"},
@@ -137,7 +144,13 @@ async def _set_mode(
     )
 
 
-async def _request_state(state, session) -> CommandOutcome:
+async def build_state_payload(state) -> dict[str, Any]:
+    """
+    The ``device.state`` body: everything this device currently believes.
+
+    Shared by the ``device.request_state`` command and by the push that follows
+    a local relay change, so a dashboard sees the same shape either way.
+    """
     snapshot = await state.get_snapshot()
     relay_controller = state.relay_controller
 
@@ -151,17 +164,26 @@ async def _request_state(state, session) -> CommandOutcome:
     config_version, schedule_version = await state.get_active_versions()
     read_at = snapshot["read_at"]
 
-    payload = {
+    return {
         "temperatures_c": {str(k): v for k, v in snapshot["temperatures"].items()},
         "gas": {str(k): v for k, v in snapshot["gas"].items()},
         "relays": relays,
         "modes": {str(t): m for t, m in (await state.get_modes()).items()},
         "active_config_version": config_version,
         "active_schedule_version": schedule_version,
+        # A schedule edited on the device keeps the published version number —
+        # there is no API to tell the server otherwise — so this is the only
+        # way a dashboard can see that the room is not running v<n> as published.
+        "schedule_locally_modified": schedule_runner.is_locally_modified,
+        "schedule_local_revision": schedule_runner.local_revision,
+        "config_locally_modified": config_store.is_locally_modified,
+        "config_local_revision": config_store.local_revision,
         "read_at": read_at.isoformat() if read_at else None,
     }
 
-    await session.send_message("device.state", payload)
+
+async def _request_state(state, session) -> CommandOutcome:
+    await session.send_message("device.state", await build_state_payload(state))
     return CommandOutcome(STATUS_EXECUTED, detail="device.state pushed")
 
 
@@ -196,6 +218,7 @@ async def _acknowledge_alarm(state) -> CommandOutcome:
         return _failed("no relay mapped with role 'alarm'")
 
     await relay_controller.turn_off(relay_id)
+    await state.notify_state_change(f"relay {relay_id} off (alarm acknowledged)")
     return CommandOutcome(
         STATUS_EXECUTED,
         reported_state={"alarm": "off"},

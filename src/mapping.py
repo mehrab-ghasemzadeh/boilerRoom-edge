@@ -2,12 +2,12 @@
 Device mapping — public API.
 
 Mappings are loaded at runtime via ``await initialize_mapping()``. The default
-provider reads mapping.json; a server provider will be added later.
+provider builds the mapping from the server's device record. There is no
+local mapping file; an unpaired device waits for the server to describe it.
 
 Environment variables:
-  BOILERROOM_MAPPING_SOURCE  "file" (default) or "server"
-  BOILERROOM_MAPPING         path to mapping.json when source=file
-  BOILERROOM_MAPPING_URL     server URL when source=server (not implemented)
+  BOILERROOM_MAPPING_SOURCE  "record" (default) or "file"
+  BOILERROOM_MAPPING         mapping file path, used only when source=file
 """
 
 from mapping_schema import (

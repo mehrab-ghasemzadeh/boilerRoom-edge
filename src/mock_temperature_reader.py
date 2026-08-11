@@ -11,8 +11,8 @@ ROLE_RANGES = {
     "environment_inside": (18.0, 28.0),
     "environment_outside": (5.0, 35.0),
     "boiler_input_water": (30.0, 60.0),
-    "boiler_output_water": (40.0, 85.0),
-    "boiler_body": (40.0, 90.0),
+    "boiler_output_water": (40.0, 77.0),
+    "boiler_body": (40.0, 79.0),
 }
 
 
@@ -21,7 +21,7 @@ class MockTemperatureReader:
     def __init__(
         self,
         min_temp: float = 20.0,
-        max_temp: float = 80.0,
+        max_temp: float = 79.0,
         read_delay: float = 0.35,
     ):
         self.min_temp = min_temp

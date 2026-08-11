@@ -1,8 +1,8 @@
 """
 Mapping schema, validation, and lookup helpers.
 
-Raw mapping documents (from mapping.json or a future server API) are parsed
-into a DeviceMapping via parse_mapping().
+Raw mapping documents — built from the server device record, or read from a
+file for bench work — are parsed into a DeviceMapping via parse_mapping().
 """
 
 from __future__ import annotations
@@ -74,12 +74,16 @@ GAS_ROLES = frozenset({
     "boiler_room",
     "gas_valve",
     "exhaust",
+    # The platform's own role name for a leak detector; it appears in the
+    # device record, so the local vocabulary has to accept it.
+    "gas_leak",
 })
 
 GAS_ROLE_LABELS = {
     "boiler_room": "boiler room",
     "gas_valve": "gas valve",
     "exhaust": "exhaust",
+    "gas_leak": "gas leak detector",
 }
 
 

@@ -10,9 +10,9 @@ Two properties drive the design:
   * **Records go to the file, not the terminal.** The console belongs to the
     operator's control menu; event chatter scrolling past the prompt makes it
     unusable. Menu replies are written with ``RuntimeState.echo()``, which
-    prints without creating a record, and menu option 10 tails the log. Set
-    ``BOILERROOM_LOG_CONSOLE_LEVEL`` to a level name to mirror records to the
-    terminal while debugging.
+    prints without creating a record. Set ``BOILERROOM_LOG_CONSOLE_LEVEL`` to a
+    level name to mirror records to the terminal while debugging, or read the
+    file directly (``tail -f data/boilerroom.log``).
 
 The codebase already tags messages by subsystem (``[ws]``, ``[schedule]``,
 ``[limits]``). Those tags become logger names, so verbosity can be tuned per

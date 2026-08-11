@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import time
 from typing import Any
 
 from logging_setup import get_logger, split_tag
@@ -14,6 +15,9 @@ from logging_setup import get_logger, split_tag
 # and needless radio time on a Pi Zero W.
 DEFAULT_TELEMETRY_INTERVAL_SECONDS = 60.0
 
+# How early a read cycle may post and still count as on time. See telemetry_due.
+TELEMETRY_DUE_SLACK_SECONDS = 5.0
+
 
 class RuntimeState:
     def __init__(self, read_interval: float = 10.0):
@@ -21,6 +25,11 @@ class RuntimeState:
         # Set once a device session exists. Until then the agent runs offline
         # from its cached schedule; telemetry and the WebSocket wait for it.
         self.authenticated = asyncio.Event()
+        # Set once a usable device mapping exists. The wiring comes from the
+        # server record, so a device that has never been paired has nothing to
+        # drive until one arrives — the sensor loop waits on this rather than
+        # building hardware it cannot address.
+        self.mapping_ready = asyncio.Event()
         self.print_lock = asyncio.Lock()
         self.read_interval = read_interval
 
@@ -50,13 +59,25 @@ class RuntimeState:
         self._limit_blocks: dict[Any, str] = {}
         self.device_config = None
 
-    async def wait_authenticated(self) -> bool:
-        """Block until a session exists. Returns False if shutdown came first."""
-        if self.authenticated.is_set():
+        # Telemetry pacing lives here rather than in the sensor loop, because a
+        # relay change also posts telemetry: both have to agree on when the
+        # last post happened or they would double up.
+        self._telemetry_lock = asyncio.Lock()
+        self._last_telemetry_at: float | None = None
+
+        # Set when a relay changes locally — by the operator, the schedule or a
+        # limit cut. The server learns relay state only from telemetry, so
+        # without this a local change would wait out the whole interval.
+        self.state_changed = asyncio.Event()
+        self._state_change_reasons: list[str] = []
+
+    async def _wait_for(self, event: asyncio.Event) -> bool:
+        """Block until an event fires. Returns False if shutdown came first."""
+        if event.is_set():
             return True
 
         waiters = [
-            asyncio.create_task(self.authenticated.wait()),
+            asyncio.create_task(event.wait()),
             asyncio.create_task(self.shutdown.wait()),
         ]
         try:
@@ -65,7 +86,15 @@ class RuntimeState:
             for task in waiters:
                 if not task.done():
                     task.cancel()
-        return self.authenticated.is_set()
+        return event.is_set()
+
+    async def wait_authenticated(self) -> bool:
+        """Block until a session exists. Returns False if shutdown came first."""
+        return await self._wait_for(self.authenticated)
+
+    async def wait_mapping_ready(self) -> bool:
+        """Block until a device mapping exists. False if shutdown came first."""
+        return await self._wait_for(self.mapping_ready)
 
     async def set_ws_connected(self, connected: bool) -> None:
         async with self._ws_lock:
@@ -108,7 +137,33 @@ class RuntimeState:
 
     async def set_mode(self, target: Any, mode: str) -> None:
         async with self._control_lock:
+            if self._modes.get(target) == mode:
+                return  # no change, no write
             self._modes[target] = mode
+            snapshot = dict(self._modes)
+
+        # Persisted here rather than at the call sites so a future caller
+        # cannot set a mode that silently fails to survive a restart. The
+        # write happens outside the lock: it is file I/O, and nothing else
+        # needs to wait for it.
+        await self._persist_modes(snapshot)
+
+    async def restore_modes(self, modes: dict[Any, str]) -> None:
+        """Load modes from the cache at boot, without writing them straight back."""
+        async with self._control_lock:
+            self._modes.update(modes)
+
+    async def _persist_modes(self, modes: dict[Any, str]) -> None:
+        from mode_store import save_modes
+
+        try:
+            await save_modes(modes)
+        except Exception as exc:
+            # A cache that cannot be written must not fail the command that
+            # changed the mode; the mode is already in effect.
+            await self.log(
+                f"[mode] Could not save modes: {exc}", level=logging.WARNING
+            )
 
     async def get_mode(self, target: Any) -> str:
         async with self._control_lock:
@@ -160,6 +215,45 @@ class RuntimeState:
         if not interval:
             return DEFAULT_TELEMETRY_INTERVAL_SECONDS
         return float(interval)
+
+    # -- telemetry pacing ----------------------------------------------------
+
+    async def telemetry_due(self) -> bool:
+        """
+        Whether the telemetry interval has elapsed since the last post.
+
+        Judged with a little slack, because the check only runs on read-cycle
+        boundaries. With the read interval equal to the telemetry interval, a
+        cycle landing a second early would fail a strict comparison and defer
+        the post to the *next* cycle — turning a one-minute cadence into two.
+        """
+        interval = await self.get_telemetry_interval()
+        slack = min(TELEMETRY_DUE_SLACK_SECONDS, interval * 0.1)
+        async with self._telemetry_lock:
+            if self._last_telemetry_at is None:
+                return True
+            return time.monotonic() - self._last_telemetry_at >= interval - slack
+
+    async def mark_telemetry_posted(self) -> None:
+        async with self._telemetry_lock:
+            self._last_telemetry_at = time.monotonic()
+
+    async def notify_state_change(self, reason: str) -> None:
+        """
+        Record that a relay changed locally, so it is reported promptly.
+
+        Coalescing is the caller's gain, not its burden: a schedule tick that
+        switches four relays calls this four times and produces one post.
+        """
+        async with self._telemetry_lock:
+            self._state_change_reasons.append(reason)
+        self.state_changed.set()
+
+    async def take_state_change_reasons(self) -> list[str]:
+        async with self._telemetry_lock:
+            reasons = list(self._state_change_reasons)
+            self._state_change_reasons.clear()
+        return reasons
 
     async def get_ws_status(self) -> dict[str, Any]:
         async with self._ws_lock:

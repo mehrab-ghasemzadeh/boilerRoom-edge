@@ -5,13 +5,12 @@ load_dotenv()
 import asyncio
 import logging
 import signal
-import time
 
 from auth import AuthError, MissingCredentialsError, token_manager
 from config import load_device_mapping
 from control_menu import run_control_menu
 from data_logger import reading_store, save_readings
-from device_config import load_cached_config
+from device_config import ConfigError, config_store, load_cached_config
 from device_record import (
     DeviceRecordError,
     apply_calibration,
@@ -25,8 +24,13 @@ from device_record import (
 from errors_client import error_reporter
 from limits_guard import limit_guard
 from logging_setup import configure_logging, shutdown_logging
+from mapping_provider import MappingUnavailableError, RecordMappingProvider
+from mode_store import load_modes
+from mapping_store import mapping_store
+from record_mapping import mapping_differences
 from runtime_state import RuntimeState
-from schedule_runner import load_cached_schedule, schedule_runner
+from schedule_runner import ScheduleError, load_cached_schedule, schedule_runner
+from state_publisher import run_state_publisher
 from telemetry_client import post_telemetry
 from ws_client import CAPABILITIES, run_websocket_client
 
@@ -35,7 +39,14 @@ from ws_client import CAPABILITIES, run_websocket_client
 # ----------------------------------------------------
 
 USE_MOCK_HARDWARE = True
-DEFAULT_READ_INTERVAL = 10
+
+# Sensors are read once a minute, matching the telemetry cadence: at the old
+# 10 s there were five discarded cycles for every one that was uploaded, all of
+# them costing SD-card writes and CPU on a single-core Pi.
+#
+# This also sets how quickly the over-temperature cut can react — see the
+# limit-latency note in the README.
+DEFAULT_READ_INTERVAL = 60
 
 # How often to re-check the active schedule for a state transition
 SCHEDULE_TICK_SECONDS = 20
@@ -70,6 +81,13 @@ async def print_startup_banner(state: RuntimeState) -> None:
     await state.echo(" Boiler Room Monitoring System Started")
     await state.echo("========================================\n")
 
+    if not state.mapping_ready.is_set():
+        await state.echo(
+            "No device mapping yet — this device's wiring comes from the server\n"
+            "record. Sensors and relays stay idle until it arrives.\n"
+        )
+        return
+
     await state.echo("Equipment units:")
     for unit_id, unit in UNITS.items():
         await state.echo(f"  {unit_id}: {unit['name']}")
@@ -93,7 +111,42 @@ async def print_startup_banner(state: RuntimeState) -> None:
     await state.echo("")
 
 
+async def load_mapping(state: RuntimeState) -> bool:
+    """
+    Build the device mapping, tolerating not having one yet.
+
+    The wiring lives in the server record, so an unpaired device genuinely does
+    not know what it is connected to. Failing to start would give a restart
+    loop under systemd and no way to recover; instead the agent comes up, and
+    the record loop sets the mapping once the server supplies it.
+    """
+    try:
+        await load_device_mapping()
+    except MappingUnavailableError as exc:
+        await state.log(
+            f"[mapping] No usable device mapping — {exc}",
+            level=logging.WARNING,
+        )
+        await state.log(
+            "[mapping] Waiting for the server record; sensors and relays stay idle "
+            "until the installation is described",
+            level=logging.WARNING,
+        )
+        return False
+    except Exception as exc:
+        await state.log(f"[mapping] Failed to load: {exc}", level=logging.ERROR)
+        return False
+
+    state.mapping_ready.set()
+    return True
+
+
 async def sensor_loop(state: RuntimeState) -> None:
+    # Hardware is addressed by the mapping — GPIO pins, 1-Wire ROM codes, ADC
+    # channels — so there is nothing to construct until one exists.
+    if not await state.wait_mapping_ready():
+        return
+
     temperature_reader = TemperatureReader()
     gas_reader = GasReader()
     relay_controller = RelayController()
@@ -112,7 +165,6 @@ async def sensor_loop(state: RuntimeState) -> None:
     # than waiting for the next schedule tick.
     await schedule_runner.evaluate(state)
 
-    last_telemetry_at: float | None = None
     offline_notice_shown = False
 
     try:
@@ -138,16 +190,11 @@ async def sensor_loop(state: RuntimeState) -> None:
             # the same cycle it happens.
             await limit_guard.check(state, temperatures)
 
-            # Sensors are read far more often than telemetry is posted: one
-            # upload a minute by default, or whatever cadence config.apply asks
-            # for. The first cycle posts immediately so a fresh boot shows up
-            # on the server without waiting out the interval.
-            telemetry_interval = await state.get_telemetry_interval()
-            now = time.monotonic()
-            due = (
-                last_telemetry_at is None
-                or now - last_telemetry_at >= telemetry_interval
-            )
+            # Pacing lives in RuntimeState because a local relay change also
+            # posts telemetry; both have to share one "last posted" clock or
+            # they double up. The first cycle posts immediately so a fresh boot
+            # shows up on the server without waiting out the interval.
+            due = await state.telemetry_due()
 
             if due and not state.authenticated.is_set():
                 if not offline_notice_shown:
@@ -155,7 +202,7 @@ async def sensor_loop(state: RuntimeState) -> None:
                     await state.log("[telemetry] Offline — holding until a session exists")
             elif due:
                 offline_notice_shown = False
-                last_telemetry_at = now
+                await state.mark_telemetry_posted()
                 try:
                     await post_telemetry(state, temperatures, gas)
                 except Exception as exc:
@@ -241,24 +288,77 @@ async def restore_cached_schedule(state: RuntimeState) -> None:
     network. Reporting the cached version in device.hello also stops the server
     re-pushing an unchanged schedule on every boot.
     """
-    schedule, error = await load_cached_schedule()
+    schedule, document, error = await load_cached_schedule()
 
     if error:
         await state.log(
             f"[schedule] Ignoring unusable cache ({error}) — waiting for server push",
             level=logging.WARNING,
         )
-        return
-    if schedule is None:
+    elif schedule is None or document is None:
         await state.log("[schedule] No cached schedule — waiting for server push")
+    else:
+        schedule_runner.set_server_schedule(schedule, document)
+        await state.set_active_schedule_version(schedule.version)
+        await state.log(
+            f"[schedule] Restored cached schedule v{schedule.version} "
+            f"({len(schedule.weekly_rules)} weekly rule(s), "
+            f"{len(schedule.exceptions)} exception(s), tz={schedule.timezone_name})"
+        )
+
+    # Layered on top, so an operator's own programme survives a reboot the same
+    # way the published one does.
+    await restore_local_schedule(state)
+
+
+async def restore_local_schedule(state: RuntimeState) -> None:
+    """
+    Reload a programme edited on this device.
+
+    Kept only while it still sits on the published version it was made against:
+    if the server published something newer while this device was off, that
+    publish outranks the edits, exactly as a live push would.
+    """
+    from schedule_editor import clear_local_schedule, load_local_schedule
+
+    local, error = await load_local_schedule()
+
+    if error:
+        await state.log(
+            f"[schedule] Ignoring unusable local schedule ({error})",
+            level=logging.WARNING,
+        )
+        return
+    if local is None:
         return
 
-    schedule_runner.set_schedule(schedule)
-    await state.set_active_schedule_version(schedule.version)
+    if local.based_on_version != schedule_runner.server_version:
+        await clear_local_schedule()
+        await state.log(
+            f"[schedule] Discarded local edits made on v{local.based_on_version} — "
+            f"the server has since published v{schedule_runner.server_version}",
+            level=logging.WARNING,
+        )
+        return
+
+    try:
+        schedule = await schedule_runner.restore_local(local, state)
+    except ScheduleError as exc:
+        await clear_local_schedule()
+        await state.log(
+            f"[schedule] Discarded unusable local edits ({exc}) — "
+            "back to the published schedule",
+            level=logging.WARNING,
+        )
+        return
+
     await state.log(
-        f"[schedule] Restored cached schedule v{schedule.version} "
-        f"({len(schedule.weekly_rules)} weekly rule(s), "
-        f"{len(schedule.exceptions)} exception(s), tz={schedule.timezone_name})"
+        f"[schedule] Restored locally edited schedule v{schedule.version} "
+        f"(revision {local.revision}, saved {local.saved_at or 'unknown'}; "
+        f"{len(schedule.weekly_rules)} weekly rule(s), "
+        f"{len(schedule.exceptions)} exception(s)) — "
+        "the server's next publish replaces it",
+        level=logging.WARNING,
     )
 
 
@@ -324,6 +424,61 @@ async def adopt_device_record(state: RuntimeState, record, payload) -> None:
     for line in capability_mismatches(record, CAPABILITIES):
         await state.log(f"[device] Capability mismatch — {line}", level=logging.WARNING)
 
+    # A device that booted without a mapping can start working the moment the
+    # server describes it; only then is drift meaningful.
+    if not await adopt_mapping_if_missing(state):
+        await report_mapping_drift(state, record)
+
+
+async def adopt_mapping_if_missing(state: RuntimeState) -> bool:
+    """
+    Build the mapping from a record that has just arrived.
+
+    Only ever fills a gap: once a mapping is driving the hardware it is left
+    alone, because the relay controller configured its pins from it at startup.
+    """
+    if state.mapping_ready.is_set():
+        return False
+
+    if not await load_mapping(state):
+        return False
+
+    await state.log("[mapping] Device mapping adopted from the server record")
+    return True
+
+
+async def report_mapping_drift(state: RuntimeState, record) -> None:
+    """
+    Say so when the record's wiring no longer matches what is running.
+
+    The mapping is deliberately *not* swapped underneath a running agent: the
+    relay controller configures its GPIO pins once at startup, so adopting a
+    new pin map without re-initialising the hardware would drive pins that were
+    never set up. A restart applies it.
+    """
+    from record_mapping import RecordMappingError, mapping_from_record, readiness_problems
+
+    if not isinstance(mapping_store.provider, RecordMappingProvider):
+        return
+
+    problems = readiness_problems(record)
+    if problems:
+        for problem in problems:
+            await state.log(
+                f"[mapping] Server record not usable as a mapping — {problem}",
+                level=logging.WARNING,
+            )
+        return
+
+    try:
+        document = mapping_from_record(record)
+    except RecordMappingError as exc:
+        await state.log(f"[mapping] Server record cannot be mapped: {exc}", level=logging.WARNING)
+        return
+
+    for line in mapping_differences(document):
+        await state.log(f"[mapping] Drift — {line}", level=logging.WARNING)
+
 
 async def device_record_loop(state: RuntimeState) -> None:
     """
@@ -359,6 +514,30 @@ async def device_record_loop(state: RuntimeState) -> None:
             pass
 
 
+async def restore_cached_modes(state: RuntimeState) -> None:
+    """
+    Reload which units were left in manual.
+
+    Restored before the first schedule evaluation, so a unit an operator took
+    off the programme stays off it across a reboot instead of being handed
+    straight back to the schedule.
+    """
+    modes = await load_modes()
+    if not modes:
+        await state.log("[mode] No saved modes — every unit starts on automatic")
+        return
+
+    await state.restore_modes(modes)
+
+    manual = sorted((str(t) for t, m in modes.items() if m == "manual"))
+    if manual:
+        await state.log(
+            f"[mode] Restored {len(modes)} mode(s); still on manual: {', '.join(manual)}"
+        )
+    else:
+        await state.log(f"[mode] Restored {len(modes)} mode(s), all automatic")
+
+
 async def restore_cached_config(state: RuntimeState) -> None:
     """
     Reload the last config the server pushed.
@@ -368,23 +547,77 @@ async def restore_cached_config(state: RuntimeState) -> None:
     Reporting the cached version in device.hello also stops the server
     re-pushing an unchanged document on every boot.
     """
-    config, error = await load_cached_config()
+    config, document, error = await load_cached_config()
 
     if error:
         await state.log(
             f"[config] Ignoring unusable cache ({error}) — waiting for server push",
             level=logging.WARNING,
         )
-        return
-    if config is None:
+    elif config is None or document is None:
         await state.log("[config] No cached config — waiting for server push")
+    else:
+        config_store.set_server_document(document)
+        await state.set_device_config(config)
+        await state.set_active_config_version(config.version)
+        await state.log(
+            f"[config] Restored cached config v{config.version} "
+            f"(telemetry every {config.telemetry_interval_seconds}s)"
+        )
+
+    # Layered on top, so limits an operator set by hand survive a reboot.
+    await restore_local_config(state)
+
+
+async def restore_local_config(state: RuntimeState) -> None:
+    """
+    Reload limits edited on this device.
+
+    Kept only while they still sit on the published version they were made
+    against: if the server published a newer config while the device was off,
+    that publish outranks them, exactly as a live push would.
+    """
+    from config_editor import clear_local_config, load_local_config
+
+    local, error = await load_local_config()
+
+    if error:
+        await state.log(
+            f"[config] Ignoring unusable local limits ({error})",
+            level=logging.WARNING,
+        )
+        return
+    if local is None:
         return
 
-    await state.set_device_config(config)
-    await state.set_active_config_version(config.version)
+    if local.based_on_version != config_store.server_version:
+        await clear_local_config()
+        await state.log(
+            f"[config] Discarded local limits set on v{local.based_on_version} — "
+            f"the server has since published v{config_store.server_version}",
+            level=logging.WARNING,
+        )
+        return
+
+    try:
+        config = await config_store.restore_local(local, state)
+    except ConfigError as exc:
+        await clear_local_config()
+        await state.log(
+            f"[config] Discarded unusable local limits ({exc}) — "
+            "back to the published config",
+            level=logging.WARNING,
+        )
+        return
+
     await state.log(
-        f"[config] Restored cached config v{config.version} "
-        f"(telemetry every {config.telemetry_interval_seconds}s)"
+        f"[config] Restored locally edited limits on v{config.version} "
+        f"(revision {local.revision}, saved {local.saved_at or 'unknown'}): "
+        f"water {config.limits.min_water_temperature_c}–"
+        f"{config.limits.max_water_temperature_c} °C, "
+        f"ambient max {config.limits.max_ambient_temperature_c} °C — "
+        "the server's next publish replaces them",
+        level=logging.WARNING,
     )
 
 
@@ -412,10 +645,15 @@ async def main() -> None:
     state = RuntimeState(read_interval=DEFAULT_READ_INTERVAL)
     install_signal_handlers(state)
 
-    await load_device_mapping()
+    # The record comes first: it is the mapping source, so it has to be in
+    # place before the mapping is built from it.
     await restore_cached_device_record(state)
+    await load_mapping(state)
     await restore_cached_config(state)
     await restore_cached_schedule(state)
+    # Before any task starts, so the first schedule tick already knows which
+    # units are hands-off.
+    await restore_cached_modes(state)
     await print_startup_banner(state)
 
     auth_task = asyncio.create_task(auth_loop(state), name="auth_loop")
@@ -424,7 +662,16 @@ async def main() -> None:
     ws_task = asyncio.create_task(run_websocket_client(state), name="websocket_client")
     schedule_task = asyncio.create_task(schedule_loop(state), name="schedule_loop")
     record_task = asyncio.create_task(device_record_loop(state), name="device_record")
-    tasks = (auth_task, sensor_task, menu_task, ws_task, schedule_task, record_task)
+    publish_task = asyncio.create_task(run_state_publisher(state), name="state_publisher")
+    tasks = (
+        auth_task,
+        sensor_task,
+        menu_task,
+        ws_task,
+        schedule_task,
+        record_task,
+        publish_task,
+    )
 
     try:
         await asyncio.gather(*tasks)

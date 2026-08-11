@@ -14,12 +14,19 @@ Precedence, from weakest to strongest:
   1. default off
   2. weekly rules, in document order (a later matching rule wins)
   3. exceptions for today's date
+
+The programme can also be edited on the device itself (see schedule_editor).
+Such an edit is held as an *override* on top of the last published document:
+it drives the relays until the server publishes a schedule, at which point the
+published one wins and the override is discarded.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -345,21 +352,24 @@ def parse_schedule(payload: dict[str, Any]) -> Schedule:
 
 async def load_cached_schedule(
     path: Path | None = None,
-) -> tuple[Schedule | None, str | None]:
+) -> tuple[Schedule | None, dict[str, Any] | None, str | None]:
     """
     Load the last applied schedule from disk.
 
-    Returns ``(schedule, error)``. A missing or unreadable cache yields
-    ``(None, None)`` — that is a normal first boot, not a failure.
+    Returns ``(schedule, document, error)``. A missing or unreadable cache
+    yields ``(None, None, None)`` — that is a normal first boot, not a failure.
+
+    The raw document comes back alongside the parsed one because it is what a
+    local edit is applied to, and what discarding a local edit reverts to.
     """
     payload = await read_json(path or SCHEDULE_CACHE_PATH)
     if payload is None:
-        return None, None
+        return None, None, None
 
     try:
-        return await asyncio.to_thread(parse_schedule, payload), None
+        return await asyncio.to_thread(parse_schedule, payload), payload, None
     except ScheduleError as exc:
-        return None, str(exc)
+        return None, None, str(exc)
 
 
 async def save_cached_schedule(
@@ -395,16 +405,65 @@ class ScheduleRunner:
         self._applied: dict[Target, bool] = {}
         self._unmapped_warned: set[Target] = set()
 
+        # The raw document behind _schedule, kept so the device can edit its own
+        # programme, and the last one the server published, kept so those edits
+        # can be discarded and the published programme put back.
+        self._document: dict[str, Any] | None = None
+        self._server_document: dict[str, Any] | None = None
+
+        # 0 when the running schedule is the server's. Counts local edits
+        # otherwise, so an operator can see their changes are still in force.
+        self._local_revision = 0
+        # Whether the last local edit reached the card. An edit is already in
+        # effect by the time this is false; it just will not survive a restart.
+        self._local_persisted = True
+
     @property
     def schedule(self) -> Schedule | None:
         return self._schedule
 
-    def set_schedule(self, schedule: Schedule) -> None:
+    @property
+    def document(self) -> dict[str, Any] | None:
+        """A copy of the running document, safe for an editor to mutate."""
+        return copy.deepcopy(self._document) if self._document is not None else None
+
+    @property
+    def is_locally_modified(self) -> bool:
+        return self._local_revision > 0
+
+    @property
+    def local_revision(self) -> int:
+        return self._local_revision
+
+    @property
+    def local_persisted(self) -> bool:
+        return self._local_persisted
+
+    @property
+    def server_version(self) -> int:
+        """Version of the last published schedule; 0 if none has arrived."""
+        version = (self._server_document or {}).get("schedule_version")
+        return version if isinstance(version, int) else 0
+
+    def set_schedule(
+        self,
+        schedule: Schedule,
+        document: dict[str, Any] | None = None,
+        *,
+        local_revision: int = 0,
+    ) -> None:
         self._schedule = schedule
+        self._document = copy.deepcopy(document) if document is not None else None
+        self._local_revision = local_revision
         # Re-apply everything on the next evaluation, even if the computed
         # states match what the previous schedule had already set.
         self._applied = {}
         self._unmapped_warned = set()
+
+    def set_server_schedule(self, schedule: Schedule, document: dict[str, Any]) -> None:
+        """Adopt a published document — from a push, or from the cache at boot."""
+        self._server_document = copy.deepcopy(document)
+        self.set_schedule(schedule, document)
 
     def forget(self, target: Target) -> None:
         """Drop the cached state for a target so the schedule re-asserts it."""
@@ -462,6 +521,9 @@ class ScheduleRunner:
                 f"[schedule] {name} (relay {relay_id}) -> "
                 f"{'ON' if want_on else 'OFF'} for {target}"
             )
+            await state.notify_state_change(
+                f"relay {relay_id} {'on' if want_on else 'off'} (schedule)"
+            )
 
         return changes
 
@@ -474,8 +536,29 @@ class ScheduleRunner:
         # parse_schedule reads the tz database from disk via ZoneInfo, so keep
         # it off the event loop like every other bit of blocking I/O here.
         schedule = await asyncio.to_thread(parse_schedule, payload)
-        self.set_schedule(schedule)
+        superseded = self._local_revision
+        self.set_server_schedule(schedule, payload)
         await state.set_active_schedule_version(schedule.version)
+
+        # A publish is an explicit act by whoever owns the room, so it outranks
+        # anything edited on the device. Said out loud rather than done quietly:
+        # an operator who set a programme by hand needs to know it is gone.
+        if superseded:
+            from schedule_editor import clear_local_schedule
+
+            try:
+                await clear_local_schedule()
+            except Exception as exc:
+                await state.log(
+                    f"[schedule] Could not remove the local override file: {exc}",
+                    level=logging.WARNING,
+                )
+            await state.log(
+                f"[schedule] Published schedule v{schedule.version} supersedes "
+                f"{superseded} local edit(s) — the device now runs the published "
+                "programme",
+                level=logging.WARNING,
+            )
 
         if schedule.timezone_name and schedule.tzinfo is None:
             await state.log(
@@ -492,6 +575,149 @@ class ScheduleRunner:
         await self.evaluate(state)
         return schedule
 
+    # -- locally edited programme --------------------------------------------
+
+    async def apply_local_document(
+        self,
+        document: dict[str, Any],
+        state,
+    ) -> Schedule:
+        """
+        Adopt a programme edited on the device.
+
+        Validated by ``parse_schedule`` first, so a bad edit raises and the
+        running schedule is left exactly as it was. The version is *not*
+        bumped: it names the published document these edits sit on top of, and
+        raising it would only make the server re-push and undo them.
+        """
+        schedule = await asyncio.to_thread(parse_schedule, document)
+
+        revision = self._local_revision + 1
+        self.set_schedule(schedule, document, local_revision=revision)
+        await state.set_active_schedule_version(schedule.version)
+
+        from schedule_editor import save_local_schedule
+
+        try:
+            await save_local_schedule(
+                document,
+                based_on_version=self.server_version,
+                revision=revision,
+            )
+            self._local_persisted = True
+        except Exception as exc:
+            # The edit is already driving the relays; a card that cannot be
+            # written must not undo it. It simply will not survive a restart.
+            self._local_persisted = False
+            await state.log(
+                f"[schedule] Local edit is in effect but could not be saved: {exc}",
+                level=logging.WARNING,
+            )
+
+        await state.log(
+            f"[schedule] Running a locally edited schedule (revision {revision}, "
+            f"on top of published v{self.server_version}) — the next publish replaces it",
+            level=logging.WARNING,
+        )
+
+        await self.evaluate(state)
+        return schedule
+
+    async def restore_local(self, local, state) -> Schedule:
+        """
+        Re-adopt a saved override at boot, without re-saving or re-numbering it.
+
+        Raises ``ScheduleError`` if the stored document no longer parses; the
+        caller discards it and falls back to the published schedule.
+        """
+        schedule = await asyncio.to_thread(parse_schedule, local.document)
+        self.set_schedule(schedule, local.document, local_revision=local.revision)
+        await state.set_active_schedule_version(schedule.version)
+        return schedule
+
+    async def revert_local(self, state) -> Schedule | None:
+        """
+        Throw the local edits away and go back to the published programme.
+
+        Returns the schedule now in force, or None if nothing has ever been
+        published — in which case the relays are simply left where they are,
+        since an empty schedule switches nothing.
+        """
+        from schedule_editor import clear_local_schedule
+
+        await clear_local_schedule()
+        self._local_persisted = True
+
+        document = self._server_document
+        if document is None:
+            self._schedule = None
+            self._document = None
+            self._local_revision = 0
+            self._applied = {}
+            return None
+
+        schedule = await asyncio.to_thread(parse_schedule, document)
+        self.set_schedule(schedule, document)
+        await state.set_active_schedule_version(schedule.version)
+        await self.evaluate(state)
+        return schedule
+
+    # -- rendering -----------------------------------------------------------
+
+    def describe_weekly_rules(self) -> list[str]:
+        """Numbered weekly rules, in document order — the order edits use."""
+        schedule = self._schedule
+        if schedule is None or not schedule.weekly_rules:
+            return ["Weekly rules: none"]
+
+        reverse_days = {index: name for name, index in WEEKDAYS.items()}
+        lines = ["Weekly rules:"]
+        for position, rule in enumerate(schedule.weekly_rules, start=1):
+            days = ", ".join(reverse_days[d][:3] for d in sorted(rule.days))
+            targets = ", ".join(str(t) for t in rule.targets)
+            lines.append(
+                f"  {position}) {rule.start:%H:%M}-{rule.end:%H:%M} {days} -> "
+                f"{'ON' if rule.state else 'OFF'}  [{targets}]"
+            )
+        return lines
+
+    def describe_exceptions(self) -> list[str]:
+        schedule = self._schedule
+        if schedule is None or not schedule.exceptions:
+            return ["Exceptions: none"]
+
+        lines = ["Exceptions:"]
+        for position, exception in enumerate(schedule.exceptions, start=1):
+            window = (
+                "all day"
+                if exception.all_day or exception.start is None
+                else f"{exception.start:%H:%M}-"
+                f"{(exception.end or datetime.time.max):%H:%M}"
+            )
+            targets = ", ".join(str(t) for t in exception.targets)
+            lines.append(
+                f"  {position}) {exception.date} {window} -> "
+                f"{'ON' if exception.state else 'OFF'}  [{targets}]"
+                f"  ({exception.exception_id}: {exception.reason})"
+            )
+        return lines
+
+    def describe_now(self) -> list[str]:
+        """What the schedule wants for each target at this moment."""
+        schedule = self._schedule
+        if schedule is None:
+            return ["Now: no schedule"]
+
+        lines = ["Now:"]
+        for target, want_on in sorted(schedule.desired_states().items()):
+            relay_id = relay_for_target(target)
+            name = RELAYS.get(relay_id, {}).get("name", "unmapped") if relay_id else "unmapped"
+            lines.append(
+                f"  {target}: {'ON' if want_on else 'OFF'} "
+                f"({name}{f', relay {relay_id}' if relay_id else ''})"
+            )
+        return lines
+
     def describe(self) -> list[str]:
         """Human-readable summary for the control menu."""
         schedule = self._schedule
@@ -503,42 +729,18 @@ class ScheduleRunner:
             f"Schedule v{schedule.version} "
             f"(tz={schedule.timezone_name or 'system'}, local time {local:%Y-%m-%d %H:%M})"
         ]
-
-        reverse_days = {index: name for name, index in WEEKDAYS.items()}
-        lines.append("Weekly rules:")
-        for rule in schedule.weekly_rules:
-            days = ", ".join(reverse_days[d][:3] for d in sorted(rule.days))
-            targets = ", ".join(str(t) for t in rule.targets)
+        if self.is_locally_modified:
             lines.append(
-                f"  {rule.start:%H:%M}-{rule.end:%H:%M} {days} -> "
-                f"{'ON' if rule.state else 'OFF'}  [{targets}]"
+                f"  LOCALLY EDITED on this device (revision {self._local_revision}, "
+                f"on top of published v{self.server_version}) — "
+                "the server's next publish replaces it"
             )
+            if not self._local_persisted:
+                lines.append("  NOT SAVED to disk — these edits will not survive a restart")
 
-        if schedule.exceptions:
-            lines.append("Exceptions:")
-            for exception in schedule.exceptions:
-                window = (
-                    "all day"
-                    if exception.all_day or exception.start is None
-                    else f"{exception.start:%H:%M}-"
-                    f"{(exception.end or datetime.time.max):%H:%M}"
-                )
-                targets = ", ".join(str(t) for t in exception.targets)
-                lines.append(
-                    f"  {exception.date} {window} -> "
-                    f"{'ON' if exception.state else 'OFF'}  [{targets}]"
-                    f"  ({exception.exception_id}: {exception.reason})"
-                )
-
-        lines.append("Now:")
-        for target, want_on in sorted(schedule.desired_states().items()):
-            relay_id = relay_for_target(target)
-            name = RELAYS.get(relay_id, {}).get("name", "unmapped") if relay_id else "unmapped"
-            lines.append(
-                f"  {target}: {'ON' if want_on else 'OFF'} "
-                f"({name}{f', relay {relay_id}' if relay_id else ''})"
-            )
-
+        lines.extend(self.describe_weekly_rules())
+        lines.extend(self.describe_exceptions())
+        lines.extend(self.describe_now())
         return lines
 
 

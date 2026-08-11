@@ -9,3 +9,7 @@ data/
 
 config_cache.json
 schedule_cache.json
+schedule_local.json
+config_local.json
+mode_cache.json
+*test*

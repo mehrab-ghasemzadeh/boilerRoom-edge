@@ -9,13 +9,13 @@
   "device_status": "normal",
   "firmware_version": "1.0.0",
   "hardware_version": "edge-dev",
-  "last_seen_at": "2026-08-10T12:24:31.811782Z",
-  "last_heartbeat_at": "2026-08-10T12:24:08.976010Z",
-  "uptime_seconds": 572,
+  "last_seen_at": "2026-08-11T12:18:17.569742Z",
+  "last_heartbeat_at": "2026-08-11T12:17:57.012723Z",
+  "uptime_seconds": 62,
   "network_type": "wifi",
   "rssi_dbm": -55,
-  "active_config_version": 1,
-  "active_schedule_version": 9,
+  "active_config_version": 14,
+  "active_schedule_version": 26,
   "capabilities": {
     "supported_commands": [
       "boiler.turn_on",
@@ -42,9 +42,9 @@
       "desired_state": "off",
       "reported_state": "off",
       "desired_mode": "automatic",
-      "reported_mode": "automatic",
-      "desired_temperature_c": null,
-      "reported_temperature_c": null
+      "reported_mode": "manual",
+      "desired_temperature_c": "29.0",
+      "reported_temperature_c": "65.3"
     },
     {
       "id": 2,
@@ -52,12 +52,12 @@
       "name": "Secondary Hot Water Boiler",
       "enabled": true,
       "controller_device_id": 1,
-      "desired_state": "on",
+      "desired_state": "off",
       "reported_state": "off",
-      "desired_mode": "manual",
+      "desired_mode": "automatic",
       "reported_mode": "automatic",
-      "desired_temperature_c": null,
-      "reported_temperature_c": null
+      "desired_temperature_c": "40.0",
+      "reported_temperature_c": "51.7"
     },
     {
       "id": 5,
@@ -66,21 +66,32 @@
       "enabled": true,
       "controller_device_id": 1,
       "desired_state": "off",
-      "reported_state": "unknown",
+      "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "automatic",
-      "desired_temperature_c": null,
-      "reported_temperature_c": null
+      "desired_temperature_c": "28.0",
+      "reported_temperature_c": "57.3"
     }
   ],
   "pump_units": [
     {
-      "id": 1,
+      "id": 5,
       "index": 1,
-      "name": "pump1",
+      "name": "پمپ 1",
       "enabled": true,
       "controller_device_id": 1,
       "desired_state": "on",
+      "reported_state": "on",
+      "desired_mode": "automatic",
+      "reported_mode": "automatic"
+    },
+    {
+      "id": 4,
+      "index": 2,
+      "name": "Pump 2",
+      "enabled": true,
+      "controller_device_id": 1,
+      "desired_state": "off",
       "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "automatic"
@@ -94,14 +105,14 @@
       "physical_id": "inlet-1",
       "channel": null,
       "type": "boiler_input_water",
-      "boiler_unit": null,
+      "boiler_unit": 5,
       "sequence": 1,
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 48.83,
+      "latest_value": 45.13,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-10T12:23:06Z"
+      "latest_captured_at": "2026-08-11T12:17:11Z"
     },
     {
       "id": 2,
@@ -110,14 +121,14 @@
       "physical_id": "outlet-1",
       "channel": null,
       "type": "boiler_output_water",
-      "boiler_unit": null,
+      "boiler_unit": 5,
       "sequence": 2,
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 80.17,
+      "latest_value": 57.32,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-10T12:23:06Z"
+      "latest_captured_at": "2026-08-11T12:17:11Z"
     },
     {
       "id": 3,
@@ -126,14 +137,62 @@
       "physical_id": "ambient-1",
       "channel": null,
       "type": "environment_inside",
-      "boiler_unit": null,
+      "boiler_unit": 5,
       "sequence": 3,
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 20.56,
+      "latest_value": 23.84,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-10T12:23:06Z"
+      "latest_captured_at": "2026-08-11T12:17:11Z"
+    },
+    {
+      "id": 9,
+      "sensor_uid": "fvxdczxz",
+      "config_key": "ts_4",
+      "physical_id": "fvxdczxz",
+      "channel": null,
+      "type": "boiler_body",
+      "boiler_unit": 1,
+      "sequence": 4,
+      "unit": "C",
+      "enabled": true,
+      "calibration": {},
+      "latest_value": 65.31,
+      "latest_status": "ok",
+      "latest_captured_at": "2026-08-11T12:17:11Z"
+    },
+    {
+      "id": 10,
+      "sensor_uid": "fdbxvdzcz",
+      "config_key": "ts_5",
+      "physical_id": "fdbxvdzcz",
+      "channel": null,
+      "type": "boiler_body",
+      "boiler_unit": 2,
+      "sequence": 5,
+      "unit": "C",
+      "enabled": true,
+      "calibration": {},
+      "latest_value": 51.72,
+      "latest_status": "ok",
+      "latest_captured_at": "2026-08-11T12:17:11Z"
+    },
+    {
+      "id": 11,
+      "sensor_uid": "cxv",
+      "config_key": "ts_6",
+      "physical_id": "cxv",
+      "channel": null,
+      "type": "environment_outside",
+      "boiler_unit": 1,
+      "sequence": 6,
+      "unit": "C",
+      "enabled": true,
+      "calibration": {},
+      "latest_value": 24.83,
+      "latest_status": "ok",
+      "latest_captured_at": "2026-08-11T12:17:11Z"
     },
     {
       "id": 7,
@@ -142,14 +201,30 @@
       "physical_id": "",
       "channel": 0,
       "type": "gas_leak",
-      "boiler_unit": 1,
-      "sequence": 4,
+      "boiler_unit": 5,
+      "sequence": 7,
       "unit": "",
       "enabled": true,
       "calibration": {},
-      "latest_value": null,
-      "latest_status": "",
-      "latest_captured_at": null
+      "latest_value": 14781.0,
+      "latest_status": "ok",
+      "latest_captured_at": "2026-08-11T12:17:11Z"
+    },
+    {
+      "id": 8,
+      "sensor_uid": "gas:1",
+      "config_key": "gs_2",
+      "physical_id": "",
+      "channel": 1,
+      "type": "gas_leak",
+      "boiler_unit": 2,
+      "sequence": 8,
+      "unit": "",
+      "enabled": true,
+      "calibration": {},
+      "latest_value": 14524.0,
+      "latest_status": "ok",
+      "latest_captured_at": "2026-08-11T12:17:11Z"
     }
   ],
   "relays": [
@@ -158,13 +233,57 @@
       "relay_key": "rly_1",
       "gpio": 17,
       "role": "pot",
-      "boiler_unit": 2,
+      "boiler_unit": 5,
       "pump_unit": null,
       "enabled": true,
       "created_at": "2026-08-10T12:39:06.911391Z",
-      "updated_at": "2026-08-10T12:39:06.915424Z"
+      "updated_at": "2026-08-11T12:08:05.641795Z"
+    },
+    {
+      "id": 2,
+      "relay_key": "rly_2",
+      "gpio": 18,
+      "role": "pot",
+      "boiler_unit": 1,
+      "pump_unit": null,
+      "enabled": true,
+      "created_at": "2026-08-10T15:07:19.716308Z",
+      "updated_at": "2026-08-11T12:08:05.649235Z"
+    },
+    {
+      "id": 3,
+      "relay_key": "rly_3",
+      "gpio": 19,
+      "role": "pot",
+      "boiler_unit": 2,
+      "pump_unit": null,
+      "enabled": true,
+      "created_at": "2026-08-10T15:07:19.725486Z",
+      "updated_at": "2026-08-11T12:08:05.655804Z"
+    },
+    {
+      "id": 4,
+      "relay_key": "rly_4",
+      "gpio": 20,
+      "role": "pump",
+      "boiler_unit": null,
+      "pump_unit": 5,
+      "enabled": true,
+      "created_at": "2026-08-10T16:11:41.656817Z",
+      "updated_at": "2026-08-11T12:08:05.662166Z"
+    },
+    {
+      "id": 5,
+      "relay_key": "rly_5",
+      "gpio": 21,
+      "role": "pump",
+      "boiler_unit": null,
+      "pump_unit": 4,
+      "enabled": true,
+      "created_at": "2026-08-11T12:08:05.668936Z",
+      "updated_at": "2026-08-11T12:08:05.669515Z"
     }
   ],
   "created_at": "2026-08-01T15:20:14Z",
-  "updated_at": "2026-08-10T12:24:08.976231Z"
+  "updated_at": "2026-08-11T12:17:57.012988Z"
 }

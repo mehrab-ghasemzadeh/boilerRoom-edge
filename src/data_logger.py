@@ -48,6 +48,16 @@ RETENTION_DAYS = int(os.environ.get("BOILERROOM_DATA_RETENTION_DAYS", "30"))
 
 PRUNE_INTERVAL_SECONDS = 3600
 
+# Cap on undelivered telemetry. At roughly 1.5 KB an envelope and one a minute,
+# 5,000 rows is about 7 MB and three and a half days of outage. Past that the
+# oldest are dropped: an SD card that fills up takes the whole agent with it.
+OUTBOX_MAX_PENDING = int(os.environ.get("BOILERROOM_OUTBOX_MAX_PENDING", "5000"))
+
+# After this many failed deliveries a row is left behind rather than retried
+# forever. Without it, one envelope the server always rejects would sit at the
+# head of the queue and block everything behind it.
+OUTBOX_MAX_ATTEMPTS = int(os.environ.get("BOILERROOM_OUTBOX_MAX_ATTEMPTS", "5"))
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
     id            INTEGER PRIMARY KEY,
@@ -67,6 +77,25 @@ CREATE INDEX IF NOT EXISTS idx_readings_captured_at
 
 CREATE INDEX IF NOT EXISTS idx_readings_sensor
     ON readings (sensor_id, captured_at);
+
+-- Telemetry that could not be delivered. The whole envelope is kept verbatim,
+-- so a replay carries the original captured_at rather than pretending the
+-- readings were taken when the network came back.
+CREATE TABLE IF NOT EXISTS telemetry_outbox (
+    id             INTEGER PRIMARY KEY,
+    captured_at    TEXT    NOT NULL,
+    envelope       TEXT    NOT NULL,
+    sync_to_server INTEGER NOT NULL DEFAULT 0,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    queued_at      TEXT    NOT NULL,
+    synced_at      TEXT
+);
+
+-- Partial: the pending rows are the only ones ever queried in the hot path,
+-- and they are a small minority once the link is healthy.
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+    ON telemetry_outbox (id) WHERE sync_to_server = 0;
 """
 
 
@@ -172,6 +201,13 @@ class ReadingStore:
             cursor = connection.execute(
                 "DELETE FROM readings WHERE captured_at < ?", (cutoff,)
             )
+            # Delivered telemetry is kept only as an audit trail, and rows the
+            # queue gave up on are dead weight. Both age out with the readings.
+            connection.execute(
+                "DELETE FROM telemetry_outbox WHERE queued_at < ? AND ("
+                "sync_to_server = 1 OR attempts >= ?)",
+                (cutoff, OUTBOX_MAX_ATTEMPTS),
+            )
         return cursor.rowcount or 0
 
     def _prune_sync(self) -> int:
@@ -203,6 +239,101 @@ class ReadingStore:
             "sensors": sensors or 0,
             "size_bytes": size,
             "retention_days": RETENTION_DAYS,
+        }
+
+    # -- telemetry outbox ----------------------------------------------------
+
+    def _enqueue_telemetry_sync(
+        self, captured_at: str, envelope: str, error: str
+    ) -> int:
+        with self._lock:
+            connection = self._get_connection()
+            with connection:
+                cursor = connection.execute(
+                    "INSERT INTO telemetry_outbox ("
+                    "captured_at, envelope, sync_to_server, attempts, "
+                    "last_error, queued_at"
+                    ") VALUES (?, ?, 0, 1, ?, ?)",
+                    (captured_at, envelope, error[:500], _utc_now_iso()),
+                )
+                row_id = cursor.lastrowid
+
+                # Drop the oldest if the queue has outgrown its cap. Newer
+                # readings are the ones worth keeping: they are closer to the
+                # device's present state.
+                overflow = connection.execute(
+                    "SELECT COUNT(*) FROM telemetry_outbox WHERE sync_to_server = 0"
+                ).fetchone()[0] - OUTBOX_MAX_PENDING
+                if overflow > 0:
+                    connection.execute(
+                        "DELETE FROM telemetry_outbox WHERE id IN ("
+                        "SELECT id FROM telemetry_outbox WHERE sync_to_server = 0 "
+                        "ORDER BY id LIMIT ?)",
+                        (overflow,),
+                    )
+            return row_id
+
+    def _pending_telemetry_sync(self, limit: int) -> list[tuple[int, str, str]]:
+        with self._lock:
+            connection = self._get_connection()
+            return [
+                (row[0], row[1], row[2])
+                for row in connection.execute(
+                    "SELECT id, captured_at, envelope FROM telemetry_outbox "
+                    "WHERE sync_to_server = 0 AND attempts < ? "
+                    "ORDER BY id LIMIT ?",
+                    (OUTBOX_MAX_ATTEMPTS, limit),
+                ).fetchall()
+            ]
+
+    def _mark_synced_sync(self, row_id: int) -> None:
+        with self._lock:
+            connection = self._get_connection()
+            with connection:
+                connection.execute(
+                    "UPDATE telemetry_outbox "
+                    "SET sync_to_server = 1, synced_at = ?, last_error = NULL "
+                    "WHERE id = ?",
+                    (_utc_now_iso(), row_id),
+                )
+
+    def _record_attempt_sync(self, row_id: int, error: str) -> int:
+        with self._lock:
+            connection = self._get_connection()
+            with connection:
+                connection.execute(
+                    "UPDATE telemetry_outbox "
+                    "SET attempts = attempts + 1, last_error = ? WHERE id = ?",
+                    (error[:500], row_id),
+                )
+            return connection.execute(
+                "SELECT attempts FROM telemetry_outbox WHERE id = ?", (row_id,)
+            ).fetchone()[0]
+
+    def _outbox_stats_sync(self) -> dict[str, Any]:
+        with self._lock:
+            connection = self._get_connection()
+            pending, oldest = connection.execute(
+                "SELECT COUNT(*), MIN(captured_at) FROM telemetry_outbox "
+                "WHERE sync_to_server = 0 AND attempts < ?",
+                (OUTBOX_MAX_ATTEMPTS,),
+            ).fetchone()
+            stuck = connection.execute(
+                "SELECT COUNT(*) FROM telemetry_outbox "
+                "WHERE sync_to_server = 0 AND attempts >= ?",
+                (OUTBOX_MAX_ATTEMPTS,),
+            ).fetchone()[0]
+            synced = connection.execute(
+                "SELECT COUNT(*) FROM telemetry_outbox WHERE sync_to_server = 1"
+            ).fetchone()[0]
+
+        return {
+            "pending": pending or 0,
+            "oldest_pending": oldest,
+            "stuck": stuck or 0,
+            "synced": synced or 0,
+            "max_pending": OUTBOX_MAX_PENDING,
+            "max_attempts": OUTBOX_MAX_ATTEMPTS,
         }
 
     def _recent_sync(self, limit: int) -> list[sqlite3.Row]:
@@ -240,6 +371,25 @@ class ReadingStore:
 
     async def recent(self, limit: int = 20) -> list[sqlite3.Row]:
         return await asyncio.to_thread(self._recent_sync, limit)
+
+    async def enqueue_telemetry(
+        self, captured_at: str, envelope: str, error: str
+    ) -> int:
+        return await asyncio.to_thread(
+            self._enqueue_telemetry_sync, captured_at, envelope, error
+        )
+
+    async def pending_telemetry(self, limit: int) -> list[tuple[int, str, str]]:
+        return await asyncio.to_thread(self._pending_telemetry_sync, limit)
+
+    async def mark_telemetry_synced(self, row_id: int) -> None:
+        await asyncio.to_thread(self._mark_synced_sync, row_id)
+
+    async def record_telemetry_attempt(self, row_id: int, error: str) -> int:
+        return await asyncio.to_thread(self._record_attempt_sync, row_id, error)
+
+    async def outbox_stats(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._outbox_stats_sync)
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close_sync)

@@ -32,7 +32,7 @@ from websockets.exceptions import InvalidStatus
 
 from auth import WS_BASE_URL, device_id, token_manager
 from commands import command_executor
-from device_config import parse_config, save_cached_config
+from device_config import config_store, parse_config, save_cached_config
 from runtime_state import RuntimeState
 from schedule_runner import save_cached_schedule, schedule_runner
 from system_metrics import read_system_metrics
@@ -279,6 +279,7 @@ async def _handle_config_apply(
         return
 
     previous = await state.get_device_config()
+    superseded = config_store.set_server_document(payload)
     await state.set_device_config(config)
     await state.set_active_config_version(config.version)
 
@@ -288,6 +289,24 @@ async def _handle_config_apply(
         f"limits water {config.limits.min_water_temperature_c}–"
         f"{config.limits.max_water_temperature_c} °C)"
     )
+
+    # A publish outranks limits typed on the device, but never silently: an
+    # operator who set a cut-out by hand needs to know it has been replaced.
+    if superseded:
+        from config_editor import clear_local_config
+
+        try:
+            await clear_local_config()
+        except Exception as exc:
+            await state.log(
+                f"[ws] Could not remove the local limits override: {exc}",
+                level=logging.WARNING,
+            )
+        await state.log(
+            f"[ws] Published config v{config.version} supersedes {superseded} local "
+            "limit edit(s) — the device now runs the published limits",
+            level=logging.WARNING,
+        )
 
     # Only touch the SD card when the version actually moved.
     if previous is None or previous.version != config.version:
@@ -485,11 +504,43 @@ async def _listen_loop(session: _Session, state: RuntimeState) -> None:
         await _handle_server_message(session, message, state)
 
 
+# The live session, for tasks outside this module that need to push a message
+# on it (see push_device_state). None whenever there is no connection.
+_active_session: "_Session | None" = None
+
+
+async def push_device_state(state: RuntimeState) -> bool:
+    """
+    Push ``device.state`` on the open session, if there is one.
+
+    Cheap compared with a telemetry POST — no TLS handshake, which matters on
+    the Pi Zero W — so it is what makes a local change show up on a dashboard
+    immediately. It does *not* replace telemetry: DEVICE.md defines this
+    message as a live dashboard push, and only ``boiler_states`` /
+    ``pump_states`` in telemetry update a unit's stored ``reported_state``.
+    """
+    session = _active_session
+    if session is None:
+        return False
+
+    from commands import build_state_payload
+
+    try:
+        await session.send_message("device.state", await build_state_payload(state))
+        return True
+    except Exception as exc:
+        await state.log(f"[ws] device.state push failed: {exc}", level=logging.DEBUG)
+        return False
+
+
 async def _run_session(state: RuntimeState) -> None:
+    global _active_session
+
     await state.log(f"[ws] Connecting to {_ws_url()} ...")
 
     ws, _auth_mode = await _connect_ws(state)
     session = _Session(ws)
+    _active_session = session
     heartbeat_task: asyncio.Task | None = None
 
     try:
@@ -510,6 +561,7 @@ async def _run_session(state: RuntimeState) -> None:
         )
         await _listen_loop(session, state)
     finally:
+        _active_session = None
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -21,6 +21,10 @@ class MappingStore:
     def is_loaded(self) -> bool:
         return self._mapping is not None
 
+    @property
+    def provider(self) -> MappingProvider:
+        return self._provider
+
     def get(self) -> DeviceMapping:
         if self._mapping is None:
             raise RuntimeError(

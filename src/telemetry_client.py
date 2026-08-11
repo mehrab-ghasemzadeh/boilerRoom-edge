@@ -13,19 +13,31 @@ device that has just reported a fault would be actively misleading.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import json
+import logging
 import uuid
 from typing import Any
 
 from auth import device_id as _device_id
 from auth import token_manager
 from config import GAS_SENSORS, RELAYS, TEMPERATURE_SENSORS
+from data_logger import OUTBOX_MAX_ATTEMPTS, reading_store
 from device_record import device_record_store
 from mapping_schema import api_sensor_id
 from schedule_runner import Target
 from system_metrics import read_system_metrics, uptime_seconds
 
 SCHEMA_VERSION = 1
+
+# How many queued envelopes to retry per send. Each is a separate TLS
+# handshake on one ARMv6 core, so the backlog drains steadily rather than
+# monopolising a cycle: 10 a minute clears a day's outage in about two hours.
+FLUSH_BATCH = 10
+
+# Serialises every send, so a backlog replay can never overtake a live post.
+_send_lock = asyncio.Lock()
 
 TEMPERATURE_ROLE_TO_API_TYPE = {
     "boiler_input_water": "inlet_temperature",
@@ -217,16 +229,116 @@ async def build_telemetry_envelope(
     return envelope
 
 
+async def _send(envelope: dict[str, Any]) -> dict[str, Any]:
+    path = f"/api/v1/devices/{_device_id()}/telemetry"
+    return await token_manager.request_json("POST", path, envelope)
+
+
+class TelemetryQueued(RuntimeError):
+    """The envelope was stored for retry instead of being delivered."""
+
+
+async def flush_outbox(state, limit: int = FLUSH_BATCH) -> tuple[int, bool]:
+    """
+    Re-send undelivered telemetry, oldest first.
+
+    Returns ``(delivered, drained)``, where ``drained`` means the queue is now
+    empty — the caller must not send anything newer until it is.
+
+    Stops at the first failure: if one post cannot reach the server, the next
+    almost certainly cannot either, and a Pi Zero W should not spend its cycle
+    on a queue of doomed TLS handshakes.
+
+    Order matters beyond tidiness. ``boiler_states`` / ``pump_states`` set the
+    server's ``reported_state``, so a backlog entry delivered *after* the live
+    post would leave the cloud showing a relay position from minutes ago. The
+    caller holds ``_send_lock`` across the flush and its own post to keep the
+    sequence strictly chronological.
+    """
+    pending = await reading_store.pending_telemetry(limit)
+    if not pending:
+        return 0, True
+
+    sent = 0
+    blocked = False
+    for row_id, captured_at, raw in pending:
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            # Unparseable rows would block the queue forever otherwise.
+            await reading_store.record_telemetry_attempt(row_id, f"corrupt: {exc}")
+            continue
+
+        try:
+            await _send(envelope)
+        except Exception as exc:
+            attempts = await reading_store.record_telemetry_attempt(row_id, str(exc))
+            if attempts >= OUTBOX_MAX_ATTEMPTS:
+                await state.log(
+                    f"[telemetry] Giving up on the backlog entry from {captured_at} "
+                    f"after {attempts} attempts: {exc}",
+                    level=logging.WARNING,
+                )
+            blocked = True
+            break
+
+        await reading_store.mark_telemetry_synced(row_id)
+        sent += 1
+
+    if sent:
+        await state.log(
+            f"[telemetry] Delivered {sent} queued envelope(s) from the outbox"
+        )
+
+    # A full batch means there may be more behind it; either way the queue is
+    # not known to be empty, so nothing newer may go ahead of it.
+    return sent, not blocked and len(pending) < limit
+
+
 async def post_telemetry(
     state,
     temperatures: dict[int, float | None],
     gas: dict[int, int],
 ) -> dict[str, Any]:
-    """POST a telemetry envelope to the server. Returns the API response."""
-    envelope = await build_telemetry_envelope(state, temperatures, gas)
-    path = f"/api/v1/devices/{_device_id()}/telemetry"
+    """
+    POST a telemetry envelope. Returns the API response.
 
-    response = await token_manager.request_json("POST", path, envelope)
+    A failed post is not lost: the envelope goes to the outbox and is retried
+    with its original ``captured_at``, so the server ends up with the readings
+    as they were taken rather than a gap.
+    """
+    envelope = await build_telemetry_envelope(state, temperatures, gas)
+
+    async with _send_lock:
+        # Anything queued goes first, so the live post is the last word on
+        # relay state.
+        _, drained = await flush_outbox(state)
+
+        if not drained:
+            # Sending now would put this envelope ahead of older ones still in
+            # the queue. They carry boiler_states / pump_states too, so
+            # delivering them afterwards would rewind the server's view of the
+            # relays. Queue this one and keep the order intact.
+            await reading_store.enqueue_telemetry(
+                envelope["captured_at"], json.dumps(envelope), "queued behind backlog"
+            )
+            raise TelemetryQueued(
+                "backlog not drained — envelope queued to preserve ordering"
+            )
+
+        try:
+            response = await _send(envelope)
+        except Exception as exc:
+            await reading_store.enqueue_telemetry(
+                envelope["captured_at"], json.dumps(envelope), str(exc)
+            )
+            await state.log(
+                f"[telemetry] Post failed, queued for retry "
+                f"(captured_at={envelope['captured_at']}): {exc}",
+                level=logging.WARNING,
+            )
+            raise
+
     await state.log(
         f"[telemetry] Posted {len(envelope['sensor_readings'])} readings "
         f"(seq={envelope['sequence']}, status={envelope['device_status']})"
