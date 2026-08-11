@@ -12,17 +12,28 @@ back to ``parse_schedule`` before it is accepted, so a locally built schedule
 passes exactly the checks a server push does. There is deliberately no second,
 weaker validator here to drift out of step with the real one.
 
-Precedence is one-way and deliberate:
+An edit is **offered upstream**: ``schedule.update`` (DEVICE.md) hands the new
+weekly rules to the server, which creates a schedule version for the room and
+names it in ``schedule.update_ack``. The edit then stops being local at all —
+it *is* the room's schedule, and the server pushes it to the room's other
+devices.
 
-  * a local edit holds until the server publishes a schedule
-  * a ``schedule.apply`` supersedes local edits and deletes the override
+Everything below is what happens until that succeeds, which matters because the
+device is expected to run through outages:
 
-DEVICE.md has no device -> server schedule API, so the cloud cannot be told
-about an edit. The device therefore keeps reporting the *server's*
-``schedule_version``: bumping it would only make the server notice a mismatch
-on the next hello and re-push, wiping the operator's change. That leaves a
-divergence the server cannot see, so everything that can show it does — the
-control menu, the log at WARNING, and ``device.state`` for the dashboard.
+  * the edit drives the relays immediately, published or not
+  * it is held as an override on the last published version, and retried on
+    the next connection
+  * while unpublished the device keeps reporting the *published*
+    ``schedule_version`` — bumping it would only make the server notice a
+    mismatch on the next hello and push its own schedule back, wiping the
+    change before it could be offered
+  * a ``schedule.apply`` supersedes an unpublished edit and deletes the
+    override: the room's owner published something, and that outranks a local
+    edit that never made it up
+
+An unpublished edit is a divergence the server cannot see, so everything that
+can show it does — the control menu, the log at WARNING, and ``device.state``.
 """
 
 from __future__ import annotations
@@ -152,6 +163,25 @@ def parse_date_text(raw: str, *, today: datetime.date) -> str:
 #
 # Each returns a new document; none of them mutate the one they are given, so a
 # rejected edit leaves the running schedule untouched.
+
+
+def update_payload(document: dict[str, Any]) -> dict[str, Any]:
+    """
+    A ``schedule.update`` payload built from an edited document (DEVICE.md).
+
+    ``schedule_version`` is deliberately left out: the server creates the new
+    version and tells us which it is in ``schedule.update_ack``.
+
+    ``exceptions`` and ``timezone`` are documented as optional but are always
+    sent, because the server builds a whole new schedule from this message.
+    Omitting an empty ``exceptions`` would leave it ambiguous whether the
+    exceptions an operator has just deleted should survive.
+    """
+    return {
+        "timezone": str(document.get("timezone") or ""),
+        "weekly_rules": document.get("weekly_rules") or [],
+        "exceptions": document.get("exceptions") or [],
+    }
 
 
 def blank_document(*, version: int = 0, timezone_name: str = "") -> dict[str, Any]:

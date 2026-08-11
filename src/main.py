@@ -424,10 +424,46 @@ async def adopt_device_record(state: RuntimeState, record, payload) -> None:
     for line in capability_mismatches(record, CAPABILITIES):
         await state.log(f"[device] Capability mismatch — {line}", level=logging.WARNING)
 
+    await adopt_record_setpoints(state, record)
+
     # A device that booted without a mapping can start working the moment the
     # server describes it; only then is drift meaningful.
     if not await adopt_mapping_if_missing(state):
         await report_mapping_drift(state, record)
+
+
+async def adopt_record_setpoints(state: RuntimeState, record) -> None:
+    """
+    Take each boiler's setpoint from the server record.
+
+    Unlike ``desired_state`` and ``desired_mode``, which are reported and never
+    applied because acting on them would race the command flow,
+    ``desired_temperature_c`` *is* the setpoint: DEVICE.md has the server push
+    it to devices as ``boiler.apply_temperature``, so the record is simply the
+    same instruction arriving by poll instead of by socket. Applying it is what
+    lets a device pick up a temperature set from an app while it was offline.
+
+    Only a change is written, so this costs the card nothing on a steady state.
+    """
+    from setpoint_store import SetpointError
+
+    for unit in record.boiler_units:
+        wanted = unit.desired_temperature_c
+        if wanted is None:
+            continue
+        if await state.get_setpoint(unit.index) == wanted:
+            continue
+        try:
+            await state.set_setpoint(unit.index, wanted, published=True)
+        except SetpointError as exc:
+            await state.log(
+                f"[device] Ignoring boiler {unit.index} setpoint from the record: {exc}",
+                level=logging.WARNING,
+            )
+            continue
+        await state.log(
+            f"[device] Boiler {unit.index} setpoint {wanted:.1f} °C from the server record"
+        )
 
 
 async def adopt_mapping_if_missing(state: RuntimeState) -> bool:
@@ -522,6 +558,20 @@ async def restore_cached_modes(state: RuntimeState) -> None:
     off the programme stays off it across a reboot instead of being handed
     straight back to the schedule.
     """
+    from setpoint_store import load_setpoints
+
+    setpoints = await load_setpoints()
+    if setpoints:
+        await state.restore_setpoints(setpoints)
+        await state.log(
+            "[setpoint] Restored "
+            + ", ".join(
+                f"boiler {i} at {e.temperature_c:.1f} °C"
+                + ("" if e.published else " (not yet published)")
+                for i, e in sorted(setpoints.items())
+            )
+        )
+
     modes = await load_modes()
     if not modes:
         await state.log("[mode] No saved modes — every unit starts on automatic")

@@ -9,13 +9,13 @@
   "device_status": "normal",
   "firmware_version": "1.0.0",
   "hardware_version": "edge-dev",
-  "last_seen_at": "2026-08-11T12:18:17.569742Z",
-  "last_heartbeat_at": "2026-08-11T12:17:57.012723Z",
-  "uptime_seconds": 62,
+  "last_seen_at": "2026-08-11T14:19:17.244364Z",
+  "last_heartbeat_at": "2026-08-11T14:18:57.263304Z",
+  "uptime_seconds": 92,
   "network_type": "wifi",
   "rssi_dbm": -55,
   "active_config_version": 14,
-  "active_schedule_version": 26,
+  "active_schedule_version": 28,
   "capabilities": {
     "supported_commands": [
       "boiler.turn_on",
@@ -43,8 +43,8 @@
       "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "manual",
-      "desired_temperature_c": "29.0",
-      "reported_temperature_c": "65.3"
+      "desired_temperature_c": "80.0",
+      "reported_temperature_c": "48.4"
     },
     {
       "id": 2,
@@ -56,8 +56,8 @@
       "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "automatic",
-      "desired_temperature_c": "40.0",
-      "reported_temperature_c": "51.7"
+      "desired_temperature_c": "80.0",
+      "reported_temperature_c": "76.5"
     },
     {
       "id": 5,
@@ -69,8 +69,8 @@
       "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "automatic",
-      "desired_temperature_c": "28.0",
-      "reported_temperature_c": "57.3"
+      "desired_temperature_c": "80.0",
+      "reported_temperature_c": "61.4"
     }
   ],
   "pump_units": [
@@ -80,8 +80,8 @@
       "name": "پمپ 1",
       "enabled": true,
       "controller_device_id": 1,
-      "desired_state": "on",
-      "reported_state": "on",
+      "desired_state": "off",
+      "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "automatic"
     },
@@ -91,8 +91,8 @@
       "name": "Pump 2",
       "enabled": true,
       "controller_device_id": 1,
-      "desired_state": "off",
-      "reported_state": "off",
+      "desired_state": "on",
+      "reported_state": "on",
       "desired_mode": "automatic",
       "reported_mode": "automatic"
     }
@@ -110,9 +110,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 45.13,
+      "latest_value": 36.82,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 2,
@@ -126,9 +126,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 57.32,
+      "latest_value": 61.36,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 3,
@@ -142,9 +142,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 23.84,
+      "latest_value": 18.35,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 9,
@@ -158,9 +158,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 65.31,
+      "latest_value": 48.39,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 10,
@@ -174,9 +174,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 51.72,
+      "latest_value": 76.54,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 11,
@@ -190,9 +190,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 24.83,
+      "latest_value": 30.96,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 7,
@@ -206,9 +206,9 @@
       "unit": "",
       "enabled": true,
       "calibration": {},
-      "latest_value": 14781.0,
+      "latest_value": 12226.0,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     },
     {
       "id": 8,
@@ -222,9 +222,9 @@
       "unit": "",
       "enabled": true,
       "calibration": {},
-      "latest_value": 14524.0,
+      "latest_value": 13678.0,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T12:17:11Z"
+      "latest_captured_at": "2026-08-11T14:18:41Z"
     }
   ],
   "relays": [
@@ -285,5 +285,5 @@
     }
   ],
   "created_at": "2026-08-01T15:20:14Z",
-  "updated_at": "2026-08-11T12:17:57.012988Z"
+  "updated_at": "2026-08-11T14:18:57.263642Z"
 }

@@ -60,6 +60,7 @@ CAPABILITIES = {
         "boiler.turn_on",
         "boiler.turn_off",
         "boiler.set_mode",
+        "boiler.set_temperature",
         "pump.turn_on",
         "pump.turn_off",
         "pump.set_mode",
@@ -437,6 +438,119 @@ async def _handle_command_execute(
     )
 
 
+async def _handle_schedule_update_ack(
+    message: dict[str, Any],
+    state: RuntimeState,
+) -> None:
+    """
+    Outcome of a schedule this device published (DEVICE.md ``schedule.update``).
+
+    On success the cloud has created a schedule version out of what we sent, so
+    the local edit is no longer an override — it is the room's schedule, at the
+    version named here.
+
+    The state change happens regardless of whether anyone is still waiting on
+    the reply: an ack that arrives after the menu gave up waiting must still be
+    acted on, or the device would keep flagging a divergence that no longer
+    exists.
+    """
+    payload = message.get("payload") or {}
+    correlation_id = str(message.get("correlation_id") or "")
+    version = payload.get("schedule_version")
+
+    if payload.get("ok") and isinstance(version, int):
+        schedule = await schedule_runner.adopt_published_version(version, state)
+        await state.log(
+            f"[ws] Schedule published — the server created v{schedule.version} "
+            f"from this device's edits ({len(schedule.weekly_rules)} weekly rule(s), "
+            f"{len(schedule.exceptions)} exception(s))"
+        )
+    else:
+        await state.log(
+            f"[ws] Server rejected schedule.update: {payload.get('error') or payload} "
+            "— the edits stay local and will be retried on the next connection",
+            level=logging.WARNING,
+        )
+
+    future = _pending_acks.get(correlation_id)
+    if future is not None and not future.done():
+        future.set_result(payload)
+
+
+async def _handle_set_temperature_ack(
+    message: dict[str, Any],
+    state: RuntimeState,
+) -> None:
+    """
+    Outcome of a setpoint this device published (``boiler.set_temperature``).
+
+    Acted on whether or not a caller is still waiting: an ack that arrives
+    after the menu gave up must still mark the setpoint published, or it would
+    be offered again on every reconnect.
+    """
+    payload = message.get("payload") or {}
+    correlation_id = str(message.get("correlation_id") or "")
+    index = payload.get("boiler_index")
+
+    if payload.get("ok") and isinstance(index, int):
+        await state.mark_setpoint_published(index)
+        await state.log(
+            f"[ws] Server accepted boiler {index} setpoint "
+            f"{payload.get('temperature_c')} °C"
+        )
+    else:
+        await state.log(
+            f"[ws] Server rejected boiler.set_temperature: "
+            f"{payload.get('error') or payload} — kept locally and retried on "
+            "the next connection",
+            level=logging.WARNING,
+        )
+
+    future = _pending_acks.get(correlation_id)
+    if future is not None and not future.done():
+        future.set_result(payload)
+
+
+async def _handle_apply_temperature(
+    message: dict[str, Any],
+    state: RuntimeState,
+) -> None:
+    """
+    A setpoint another device in this room published (``boiler.apply_temperature``).
+
+    Marked published on arrival: it came *from* the server, so offering it back
+    would be a pointless round trip. There is no ack for this message.
+    """
+    from setpoint_store import SetpointError
+
+    payload = message.get("payload") or {}
+    index = payload.get("boiler_index")
+    temperature = payload.get("temperature_c")
+
+    if not isinstance(index, int):
+        await state.log(
+            f"[ws] boiler.apply_temperature without a boiler_index: {payload}",
+            level=logging.WARNING,
+        )
+        return
+
+    try:
+        await state.set_setpoint(index, temperature, published=True)
+    except SetpointError as exc:
+        await state.log(
+            f"[ws] boiler.apply_temperature for boiler {index} refused: {exc}",
+            level=logging.WARNING,
+        )
+        return
+
+    await state.log(
+        f"[ws] Boiler {index} setpoint set to {float(temperature):.1f} °C "
+        "by another device in this room"
+    )
+    # The cut-out moves with the setpoint, so report the new state promptly.
+    await state.notify_state_change(f"boiler {index} setpoint {float(temperature):.1f} °C (peer)")
+
+
 async def _handle_server_message(
     session: _Session,
     message: dict[str, Any],
@@ -450,6 +564,12 @@ async def _handle_server_message(
         await _handle_config_apply(session, message, state)
     elif msg_type == "command.execute":
         await _handle_command_execute(session, message, state)
+    elif msg_type == "schedule.update_ack":
+        await _handle_schedule_update_ack(message, state)
+    elif msg_type == "boiler.set_temperature_ack":
+        await _handle_set_temperature_ack(message, state)
+    elif msg_type == "boiler.apply_temperature":
+        await _handle_apply_temperature(message, state)
     elif msg_type != "device.hello_ack":
         await state.log(f"[ws] Received {msg_type}")
 
@@ -508,6 +628,150 @@ async def _listen_loop(session: _Session, state: RuntimeState) -> None:
 # on it (see push_device_state). None whenever there is no connection.
 _active_session: "_Session | None" = None
 
+# Replies we are waiting on, keyed by the event_id we correlated them with.
+# Only the listen loop resolves these, so a caller can await an answer without
+# reading from the socket itself.
+_pending_acks: dict[str, asyncio.Future] = {}
+
+# How long to wait for schedule.update_ack before treating the edit as
+# unpublished. It stays queued either way; this only bounds how long an
+# operator stares at the menu.
+SCHEDULE_UPDATE_ACK_TIMEOUT = 10.0
+
+
+async def publish_schedule_update(
+    state: RuntimeState,
+    *,
+    timeout: float = SCHEDULE_UPDATE_ACK_TIMEOUT,
+) -> dict[str, Any] | None:
+    """
+    Send the locally edited schedule to the server (DEVICE.md ``schedule.update``).
+
+    Returns the ack payload, or None when there is no session or no reply
+    arrived in time — in which case the edit simply stays a local override and
+    is retried on the next connection. Nothing is lost either way.
+    """
+    from schedule_editor import update_payload
+
+    session = _active_session
+    document = schedule_runner.document
+    if session is None or document is None:
+        return None
+
+    message = build_message("schedule.update", update_payload(document))
+    event_id = message["event_id"]
+
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    _pending_acks[event_id] = future
+    try:
+        await session.send_raw(message)
+        await state.log(
+            f"[ws] Sent schedule.update (event_id={event_id}, "
+            f"{len(document.get('weekly_rules') or [])} weekly rule(s))"
+        )
+        return await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        await state.log(
+            f"[ws] No schedule.update_ack within {timeout:.0f}s — "
+            "keeping the edits local and retrying on the next connection",
+            level=logging.WARNING,
+        )
+        return None
+    except Exception as exc:
+        await state.log(f"[ws] schedule.update failed: {exc}", level=logging.WARNING)
+        return None
+    finally:
+        _pending_acks.pop(event_id, None)
+
+
+async def publish_boiler_temperature(
+    state: RuntimeState,
+    index: int,
+    temperature: float,
+    *,
+    timeout: float = SCHEDULE_UPDATE_ACK_TIMEOUT,
+) -> dict[str, Any] | None:
+    """
+    Send one boiler's setpoint to the server (DEVICE.md ``boiler.set_temperature``).
+
+    Returns the ack payload, or None when there is no session or no reply
+    arrived in time — the setpoint stays unpublished and is retried on the next
+    connection. It is already driving the cut-out either way.
+    """
+    session = _active_session
+    if session is None:
+        return None
+
+    message = build_message(
+        "boiler.set_temperature",
+        {"boiler_index": index, "temperature_c": float(temperature)},
+    )
+    event_id = message["event_id"]
+
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    _pending_acks[event_id] = future
+    try:
+        await session.send_raw(message)
+        await state.log(
+            f"[ws] Sent boiler.set_temperature (boiler {index}, "
+            f"{float(temperature):.1f} °C, event_id={event_id})"
+        )
+        return await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        await state.log(
+            f"[ws] No boiler.set_temperature_ack for boiler {index} within "
+            f"{timeout:.0f}s — retrying on the next connection",
+            level=logging.WARNING,
+        )
+        return None
+    except Exception as exc:
+        await state.log(
+            f"[ws] boiler.set_temperature failed: {exc}", level=logging.WARNING
+        )
+        return None
+    finally:
+        _pending_acks.pop(event_id, None)
+
+
+async def _publish_pending_setpoints(state: RuntimeState) -> None:
+    """
+    Offer any unacknowledged setpoints once connected.
+
+    A temperature set during an outage is held, not dropped — the same rule the
+    state publisher applies to relay changes and the schedule editor to rules.
+    """
+    pending = await state.unpublished_setpoints()
+    if not pending:
+        return
+
+    await state.log(
+        f"[ws] Publishing {len(pending)} setpoint(s) set while offline: "
+        + ", ".join(f"boiler {i} at {t:.1f} °C" for i, t in pending.items())
+    )
+    for index, temperature in pending.items():
+        if state.shutdown.is_set():
+            return
+        await publish_boiler_temperature(state, index, temperature)
+
+
+async def _publish_pending_schedule(state: RuntimeState) -> None:
+    """
+    Offer any unpublished local schedule to the server once connected.
+
+    A schedule edited while the device was offline is held, not dropped — the
+    same rule the state publisher applies to relay changes. Checked after the
+    hello handshake, because reconciliation may have pushed a schedule that
+    supersedes the edits, in which case there is nothing left to publish.
+    """
+    if not schedule_runner.is_locally_modified:
+        return
+
+    await state.log(
+        f"[ws] Publishing {schedule_runner.local_revision} local schedule edit(s) "
+        "made while offline"
+    )
+    await publish_schedule_update(state)
+
 
 async def push_device_state(state: RuntimeState) -> bool:
     """
@@ -542,6 +806,7 @@ async def _run_session(state: RuntimeState) -> None:
     session = _Session(ws)
     _active_session = session
     heartbeat_task: asyncio.Task | None = None
+    listen_task: asyncio.Task | None = None
 
     try:
         await state.set_ws_connected(True)
@@ -559,13 +824,28 @@ async def _run_session(state: RuntimeState) -> None:
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(session, state), name="ws_heartbeat"
         )
-        await _listen_loop(session, state)
+        # Started before the publish so the ack, which arrives on the listen
+        # loop, can actually be received.
+        listen_task = asyncio.create_task(
+            _listen_loop(session, state), name="ws_listen"
+        )
+        await _publish_pending_schedule(state)
+        await _publish_pending_setpoints(state)
+        await listen_task
     finally:
         _active_session = None
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await heartbeat_task
+        for task in (heartbeat_task, listen_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        # Nothing can answer these now, so wake any caller rather than leave it
+        # waiting out a timeout on a socket that has already gone. Resolved
+        # with None rather than cancelled: cancelling would raise
+        # CancelledError into the caller, which is reserved for real shutdown.
+        for future in _pending_acks.values():
+            if not future.done():
+                future.set_result(None)
         await session.close()
         await state.set_ws_connected(False)
 

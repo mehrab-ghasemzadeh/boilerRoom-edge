@@ -290,10 +290,17 @@ Implemented messages:
 
 | Direction | Messages |
 |-----------|----------|
-| Device → server | `device.hello`, `device.heartbeat`, `command.ack`, `command.result`, `config.result`, `schedule.result`, `device.state` |
-| Server → device | `device.hello_ack`, `config.apply`, `schedule.apply`, `command.execute` |
+| Device → server | `device.hello`, `device.heartbeat`, `command.ack`, `command.result`, `config.result`, `schedule.result`, `schedule.update`, `boiler.set_temperature`, `device.state` |
+| Server → device | `device.hello_ack`, `config.apply`, `schedule.apply`, `schedule.update_ack`, `boiler.set_temperature_ack`,
+`boiler.apply_temperature`, `command.execute` |
 
-Supported commands: `boiler.turn_on/off`, `boiler.set_mode`, `pump.turn_on/off`,
+`schedule.update` is the one message the device sends that *changes* cloud
+state: it publishes a schedule edited on the device, and the server answers
+`schedule.update_ack` with the version it created. See
+[Changing the programme on the device](#changing-the-programme-on-the-device).
+
+Supported commands: `boiler.turn_on/off`, `boiler.set_mode`,
+`boiler.set_temperature`, `pump.turn_on/off`,
 `pump.set_mode`, `device.request_state`, `device.restart_service`,
 `alarm.acknowledge_local`.
 
@@ -363,26 +370,47 @@ all starts one from scratch at version 0.
 flowchart LR
     A["operator edits<br/>menu option 9"] --> B["parse_schedule<br/>same validator as a push"]
     B -->|rejected| C["running schedule<br/>untouched"]
-    B -->|accepted| D["schedule_local.json<br/>+ evaluate now"]
-    D --> E["device.state push<br/>dashboard sees it"]
-    F["schedule.apply<br/>arrives"] --> G["published wins,<br/>override deleted"]
+    B -->|accepted| D["drives relays now<br/>+ schedule_local.json"]
+    D --> E["schedule.update<br/>to the server"]
+    E -->|update_ack ok| F["server creates vN<br/>override deleted,<br/>pushed to other devices"]
+    E -->|refused / offline| G["held, retried<br/>on reconnect"]
+    H["schedule.apply<br/>arrives first"] --> I["published wins,<br/>unpublished edit dropped"]
 ```
 
-Precedence is one-way and deliberate: **a local edit holds until the server
-publishes a schedule**, and that publish then wins and deletes the override.
-Publishing is an explicit act by whoever owns the room, so it outranks
-something typed on the device — but it is logged at WARNING rather than done
-quietly, because an operator who set a programme by hand needs to know it is
-gone.
+**The edit is offered upstream.** `schedule.update` (DEVICE.md) hands the new
+weekly rules to the server, which creates a schedule version for the room, sets
+it desired *and* applied, sets this device's `active_schedule_version`, and
+pushes `schedule.apply` to the room's **other** devices. At that point the edit
+is not local at all — it is the room's schedule:
 
-**The version number is not bumped.** `DEVICE.md` has no device → server
-schedule API, so the cloud cannot be told about an edit; raising the version
-would only make the server notice a mismatch on the next hello and re-push,
-undoing the operator's change. The device therefore keeps reporting the
-*published* `schedule_version`, which leaves a divergence the server cannot
-see. Everything that can show it does: the menu header, the log at WARNING on
-every edit and at every boot, and `schedule_locally_modified` in the
-`device.state` push, so a dashboard can flag the room.
+```
+[menu] Schedule updated — 06:00-08:30 mon,tue -> ON for boiler 1, pump 1.
+[menu] Publishing to the server ...
+[menu] Published — the server created schedule v34. This is now the room's
+       schedule, not a local edit.
+```
+
+Everything else here is what happens **until that succeeds**, which matters
+because the device is built to run through outages:
+
+- the edit drives the relays immediately, published or not;
+- it is held as an override on the last published version in
+  `schedule_local.json`, and **retried on the next connection** — a programme
+  changed during an outage is offered as soon as the WebSocket returns;
+- while unpublished the device keeps reporting the *published*
+  `schedule_version`. Bumping it would make the server spot a mismatch at the
+  next hello and push its own schedule back, wiping the change before it could
+  be offered;
+- a `schedule.apply` arriving first **supersedes an unpublished edit** and
+  deletes the override — the room's owner published something, and that
+  outranks an edit that never made it up. Logged at WARNING, never quiet.
+
+A refused `schedule.update` (an unpaired device, say) and a missing ack are
+treated identically: the change keeps running locally and is offered again
+later. Nothing is dropped on either path. While an edit is unpublished it is a
+divergence the server cannot see, so the menu header, a WARNING on every edit
+and every boot, and `schedule_locally_modified` on `device.state` all surface it.
+
 
 **Edits survive a restart.** They are written to `schedule_local.json`,
 atomically, separately from `schedule_cache.json` — the published document has
@@ -526,12 +554,52 @@ An unavailable sensor never counts as a cool boiler: a cut cannot clear without
 a reading. It does not trip a cut by itself either, to avoid nuisance trips on a
 flaky 1-Wire bus — the missing reading is reported as a sensor fault instead.
 
-### Changing the limits on the device
+### Per-boiler temperatures
 
-**Control-menu option 10** sets `max_water_temperature_c`,
-`min_water_temperature_c` and `max_ambient_temperature_c` locally — the same
-argument as options 7 and 9: an operator in the boiler room should not need the
-cloud to change how the boilers are protected.
+Every boiler has **its own target temperature** — DEVICE.md's per-unit
+`desired_temperature_c` — because one circuit may want 55 °C while another
+wants 75. A device-wide `max_water_temperature_c` cannot express that.
+
+**Where a boiler has a setpoint it is what the limit guard holds it at**;
+where it has none, the device-wide maximum still applies. The band rules from
+the previous section are unchanged, only the number they are built from:
+
+```
+boiler 1: setpoint 65.0 °C; probes boiler_body;  cut 68.0 °C, restore 62.0 °C  [single probe, ±3 °C]
+boiler 2: device limit;     probes boiler_body;  cut 83.0 °C, restore 77.0 °C  [single probe, ±3 °C]
+boiler 5: setpoint 70.0 °C; inlet + outlet;      cut 70.0 °C, restore 65.0 °C
+```
+
+A setpoint arrives from four directions, all of which land in the same place:
+
+| Source | Message |
+|---|---|
+| The operator, on menu option 10 | published with `boiler.set_temperature` |
+| This device, upstream | `boiler.set_temperature` → `boiler.set_temperature_ack` |
+| Another device in the room | `boiler.apply_temperature` |
+| The server | `command.execute` named `boiler.set_temperature` |
+
+Anything arriving *from* the server is marked published on the spot — offering
+it back would be a pointless round trip. A setpoint made **here** is held until
+the server acknowledges it, and retried on the next connection, so a
+temperature set during an outage is not lost. Values are bounded to the
+1–80 °C DEVICE.md accepts, on every one of the four paths, so an out-of-range
+value is refused locally rather than sent and bounced.
+
+Setpoints survive a restart in `setpoint_cache.json`, and are re-read from the
+device record's `desired_temperature_c` on every poll — which is how a
+temperature set from an app while this device was offline reaches it.
+
+Telemetry reports both numbers per boiler: `setpoint_c` (the target, updating
+the server's `desired_temperature_c`) and `temperature_c` (what the control
+probe actually reads, updating `reported_temperature_c`).
+
+### Changing the device-wide limits
+
+**Menu option 10 → 3** sets `max_water_temperature_c`,
+`min_water_temperature_c` and `max_ambient_temperature_c` locally — the
+fallback for boilers with no temperature of their own, plus the ambient limit,
+which has no per-unit equivalent.
 
 It works exactly like the schedule editor. The edit mutates the raw
 `config.apply` document and is handed to `parse_config`, so it passes the same
@@ -586,6 +654,7 @@ git-ignored.
 | `BOILERROOM_SCHEDULE_CACHE` | `schedule_cache.json` | Cached server schedule |
 | `BOILERROOM_SCHEDULE_LOCAL` | `schedule_local.json` | Programme edited on the device, if any |
 | `BOILERROOM_MODE_CACHE` | `mode_cache.json` | Per-unit automatic/manual modes |
+| `BOILERROOM_SETPOINT_CACHE` | `setpoint_cache.json` | Per-boiler target temperatures |
 | `BOILERROOM_DEVICE_RECORD_CACHE` | `device_record_cache.json` | Cached device self-detail |
 | `BOILERROOM_DATABASE` | `data/readings.db` | Local reading history |
 | `BOILERROOM_DATA_RETENTION_DAYS` | `30` | Days of readings to keep (`0` = keep everything) |
@@ -895,7 +964,7 @@ card when the fault is something a restart cannot fix.
  2) Show device mapping       7) Set unit mode (automatic/manual)
  3) Show app configuration    8) Reload device mapping
  4) Show active schedule      9) Change schedule
- 5) Show server device record 10) Change temperature limits
+ 5) Show server device record 10) Change temperatures
                               0) Quit
 ```
 
@@ -913,8 +982,8 @@ pump with its mode and relay state, and switches a unit between automatic and
 manual; setting a unit back to automatic hands it to the schedule immediately.
 Option 9 edits the heating programme itself — see
 [Changing the programme on the device](#changing-the-programme-on-the-device) —
-and option 10 the temperature limits, see
-[Changing the limits on the device](#changing-the-limits-on-the-device).
+and option 10 the boiler temperatures, see
+[Per-boiler temperatures](#per-boiler-temperatures).
 
 ---
 
@@ -934,6 +1003,7 @@ and option 10 the temperature limits, see
 | `device_config.py` | `config.apply` parsing, on-disk cache, local limit override |
 | `config_editor.py` | On-device limit edits and their on-disk override |
 | `mode_store.py` | Per-unit control modes, persisted across restarts |
+| `setpoint_store.py` | Per-boiler target temperatures, persisted across restarts |
 | `device_record.py` | `GET /devices/<id>` parsing, calibration, cache, divergence reporting |
 | `record_mapping.py` | Device record -> mapping conversion, readiness checks, drift |
 | `telemetry_client.py` | Telemetry envelope construction and POST |
@@ -959,7 +1029,9 @@ offline operation, SQLite reading history, rotating log files,
 systemd service, device self-detail with sensor calibration,
 server-derived device mapping, on-device schedule and limit editing.
 
-All four REST endpoints a device token may call are implemented:
+The device also publishes schedules upstream over the WebSocket
+(`schedule.update`). All four REST endpoints a device token may call are
+implemented:
 `POST /auth/device/login`, `POST /devices/<id>/telemetry`,
 `POST /devices/<id>/errors`, and `GET /devices/<id>`. The rest of the API
 requires a user JWT or an installer/admin role.

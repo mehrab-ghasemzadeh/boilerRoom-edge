@@ -24,6 +24,12 @@ from config_editor import (
     set_limit,
 )
 from data_logger import reading_store
+from setpoint_store import (
+    MAX_SETPOINT_C,
+    MIN_SETPOINT_C,
+    SetpointError,
+    validate as validate_setpoint,
+)
 from device_config import ConfigError, config_store, describe as describe_config
 from device_record import (
     describe as describe_record,
@@ -68,8 +74,15 @@ MENU = """
   7) Set unit mode (automatic/manual)
   8) Reload device mapping
   9) Change schedule
- 10) Change temperature limits
+ 10) Change temperatures
   0) Quit
+> """
+
+TEMPERATURE_MENU = """
+  1) Set a boiler's temperature
+  2) Clear a boiler's temperature (use the device-wide limit)
+  3) Device-wide safety limits
+  0) Back
 > """
 
 LIMITS_MENU = """
@@ -249,7 +262,7 @@ async def _show_app_config(state: RuntimeState) -> None:
         await state.echo(f"  {line}")
     # The guard needs the config too: thresholds depend on it and on how many
     # probes each unit has.
-    for line in limit_guard.describe(device_config):
+    for line in limit_guard.describe(device_config, await state.get_setpoints()):
         await state.echo(f"  {line}")
 
     modes = await state.get_modes()
@@ -531,9 +544,33 @@ async def _apply_local_edit(
 
     # Relay changes the edit caused are already reported by evaluate(); this
     # tells a dashboard the *programme* changed even when nothing switched yet.
-    from ws_client import push_device_state
+    from ws_client import publish_schedule_update, push_device_state
 
     await push_device_state(state)
+
+    # Offer it upstream. DEVICE.md's schedule.update makes the edit the room's
+    # real schedule rather than a local override, so this is what turns "the
+    # cloud disagrees with the boiler room" back into "they agree".
+    await state.echo("[menu] Publishing to the server ...")
+    ack = await publish_schedule_update(state)
+
+    if ack and ack.get("ok"):
+        await state.echo(
+            f"[menu] Published — the server created schedule "
+            f"v{ack.get('schedule_version')}. This is now the room's schedule, "
+            "not a local edit.\n"
+        )
+    elif ack:
+        await state.echo(
+            f"[menu] The server refused it: {ack.get('error') or ack}\n"
+            "[menu] The change is still running here, and will be offered "
+            "again on the next connection.\n"
+        )
+    else:
+        await state.echo(
+            "[menu] No answer from the server — the change is running here and "
+            "will be published when the device reconnects.\n"
+        )
 
 
 async def _add_weekly_rule(state: RuntimeState) -> None:
@@ -761,6 +798,200 @@ def _limits_document_for_edit() -> dict:
     return blank_config_document()
 
 
+async def _boiler_targets_with_relays() -> list[Target]:
+    return [t for t in _controllable_targets() if t.type == "boiler"]
+
+
+async def _show_temperature_status(state: RuntimeState) -> None:
+    """Every boiler's setpoint and the cut-out that follows from it."""
+    setpoints = await state.get_setpoints()
+    config = await state.get_device_config()
+
+    await state.echo("\n[menu] Boiler temperatures:")
+    for line in limit_guard.describe(config, setpoints):
+        await state.echo(f"  {line}")
+
+    unpublished = await state.unpublished_setpoints()
+    if unpublished:
+        await state.echo(
+            "  Not yet published to the server: "
+            + ", ".join(f"boiler {i}" for i in unpublished)
+            + " — will be sent on the next connection"
+        )
+
+
+async def _set_boiler_temperature(state: RuntimeState) -> None:
+    targets = await _boiler_targets_with_relays()
+    if not targets:
+        await state.echo("\n[menu] No boilers in the device mapping.\n")
+        return
+
+    setpoints = await state.get_setpoints()
+    await state.echo("")
+    for position, target in enumerate(targets, start=1):
+        entry = setpoints.get(target.index)
+        shown = f"{entry.temperature_c:.1f} °C" if entry else "not set"
+        await state.echo(f"    {position}) {str(target):<10} {shown}")
+
+    raw = await _prompt("  Which boiler? (empty = back): ")
+    if not raw:
+        await state.echo("")
+        return
+    try:
+        target = targets[int(raw) - 1]
+        if int(raw) < 1:
+            raise IndexError
+    except (ValueError, IndexError):
+        await state.echo("[menu] Invalid selection.\n")
+        return
+
+    answer = await _prompt(
+        f"  Temperature for {target} in °C "
+        f"({MIN_SETPOINT_C:g}–{MAX_SETPOINT_C:g}, empty = cancel): "
+    )
+    if not answer:
+        await state.echo("[menu] Cancelled.\n")
+        return
+
+    try:
+        temperature = validate_setpoint(answer.strip())
+    except SetpointError as exc:
+        await state.echo(f"[menu] {exc}\n")
+        return
+
+    await state.set_setpoint(target.index, temperature)
+    await state.log(
+        f"[menu] Operator set {target} temperature to {temperature:.1f} °C",
+        level=logging.WARNING,
+    )
+    await _after_temperature_change(
+        state, target.index, temperature, f"{target} set to {temperature:.1f} °C"
+    )
+
+
+async def _clear_boiler_temperature(state: RuntimeState) -> None:
+    setpoints = await state.get_setpoints()
+    if not setpoints:
+        await state.echo("\n[menu] No boiler has its own temperature set.\n")
+        return
+
+    indexes = sorted(setpoints)
+    await state.echo("")
+    for position, index in enumerate(indexes, start=1):
+        await state.echo(
+            f"    {position}) boiler {index}   {setpoints[index].temperature_c:.1f} °C"
+        )
+
+    raw = await _prompt("  Clear which? (empty = back): ")
+    if not raw:
+        await state.echo("")
+        return
+    try:
+        position = int(raw)
+        if not 1 <= position <= len(indexes):
+            raise IndexError
+    except (ValueError, IndexError):
+        await state.echo("[menu] Invalid selection.\n")
+        return
+
+    index = indexes[position - 1]
+    await state.clear_setpoint(index)
+    await state.log(
+        f"[menu] Operator cleared boiler {index}'s temperature — "
+        "it now follows the device-wide limit",
+        level=logging.WARNING,
+    )
+    await state.echo(
+        f"[menu] Boiler {index} now follows the device-wide limit.\n"
+    )
+    # There is no protocol message for "no setpoint", so the server keeps the
+    # last one it was told. Telemetry stops carrying setpoint_c, and the cut-out
+    # here follows the device limit again — said plainly rather than implied.
+    await state.echo(
+        "[menu] Note: the server keeps the last temperature it was given; "
+        "this only changes what this device holds the boiler at.\n"
+    )
+    for line in limit_guard.describe(
+        await state.get_device_config(), await state.get_setpoints()
+    ):
+        await state.echo(f"  {line}")
+    await state.echo("")
+
+    from ws_client import push_device_state
+
+    await push_device_state(state)
+
+
+async def _after_temperature_change(
+    state: RuntimeState,
+    index: int,
+    temperature: float,
+    summary: str,
+) -> None:
+    """Show the new cut-out, then offer the setpoint upstream."""
+    await state.echo(f"[menu] {summary}.")
+    for line in limit_guard.describe(
+        await state.get_device_config(), await state.get_setpoints()
+    ):
+        await state.echo(f"  {line}")
+
+    from ws_client import publish_boiler_temperature, push_device_state
+
+    await push_device_state(state)
+
+    await state.echo("[menu] Publishing to the server ...")
+    ack = await publish_boiler_temperature(state, index, temperature)
+
+    if ack and ack.get("ok"):
+        await state.echo(
+            f"[menu] Published — the server has boiler {index} at "
+            f"{ack.get('temperature_c')} °C, and has told the room's other "
+            "devices.\n"
+        )
+    elif ack:
+        await state.echo(
+            f"[menu] The server refused it: {ack.get('error') or ack}\n"
+            "[menu] The temperature is still in force here and will be offered "
+            "again on the next connection.\n"
+        )
+    else:
+        await state.echo(
+            "[menu] No answer from the server — the temperature is in force "
+            "here and will be published when the device reconnects.\n"
+        )
+
+
+async def _temperature_menu(state: RuntimeState) -> None:
+    """
+    Set each boiler's target temperature.
+
+    Per unit, because that is what DEVICE.md models: every boiler has its own
+    ``desired_temperature_c``, and one circuit may want 55 °C while another
+    wants 75. The device-wide config limits sit underneath as the fallback for
+    a boiler with no temperature of its own.
+    """
+    while not state.shutdown.is_set():
+        await _show_temperature_status(state)
+
+        try:
+            choice = await _prompt(TEMPERATURE_MENU)
+        except EOFError:
+            state.shutdown.set()
+            return
+
+        if choice == "1":
+            await _set_boiler_temperature(state)
+        elif choice == "2":
+            await _clear_boiler_temperature(state)
+        elif choice == "3":
+            await _limits_menu(state)
+        elif choice in ("0", ""):
+            await state.echo("")
+            return
+        else:
+            await state.echo(f"\n[menu] Unknown option: {choice!r}\n")
+
+
 async def _show_limits_status(state: RuntimeState) -> None:
     document = config_store.document
     version = config_store.server_version
@@ -783,7 +1014,9 @@ async def _show_limits_status(state: RuntimeState) -> None:
     # The numbers that actually matter: what each boiler cuts and restores at,
     # which is not the configured value for a single-probe unit.
     await state.echo("")
-    for line in limit_guard.describe(await state.get_device_config()):
+    for line in limit_guard.describe(
+        await state.get_device_config(), await state.get_setpoints()
+    ):
         await state.echo(f"  {line}")
 
 
@@ -821,7 +1054,7 @@ async def _apply_limit_edit(
     )
     # A limit change moves every boiler's cut-out, so show the result rather
     # than leaving the operator to work it out from the probe count.
-    for line in limit_guard.describe(config):
+    for line in limit_guard.describe(config, await state.get_setpoints()):
         await state.echo(f"  {line}")
     await state.echo("")
 
@@ -886,7 +1119,7 @@ async def _discard_local_limits(state: RuntimeState) -> None:
         )
     else:
         await state.echo(f"[menu] Back to the published config v{config.version}.")
-        for line in limit_guard.describe(config):
+        for line in limit_guard.describe(config, await state.get_setpoints()):
             await state.echo(f"  {line}")
         await state.echo("")
 
@@ -976,7 +1209,7 @@ async def _handle_choice(state: RuntimeState, choice: str) -> None:
     elif choice == "9":
         await _schedule_editor_menu(state)
     elif choice == "10":
-        await _limits_menu(state)
+        await _temperature_menu(state)
     elif choice == "0":
         await state.echo("\n[menu] Shutting down ...")
         state.shutdown.set()

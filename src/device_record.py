@@ -91,6 +91,10 @@ class ServerUnit:
     reported_state: str = ""
     desired_mode: str = ""
     reported_mode: str = ""
+    # Per-unit setpoint, DEVICE.md's boiler.set_temperature target. Sent as a
+    # string by the platform, so it is parsed rather than trusted as a number.
+    desired_temperature_c: float | None = None
+    reported_temperature_c: float | None = None
 
     @property
     def state_diverged(self) -> bool:
@@ -261,6 +265,12 @@ def _parse_units(raw: Any, kind: str) -> tuple[ServerUnit, ...]:
                 reported_state=str(entry.get("reported_state") or ""),
                 desired_mode=str(entry.get("desired_mode") or ""),
                 reported_mode=str(entry.get("reported_mode") or ""),
+                desired_temperature_c=_optional_float(
+                    entry.get("desired_temperature_c"), f"{where}.desired_temperature_c"
+                ),
+                reported_temperature_c=_optional_float(
+                    entry.get("reported_temperature_c"), f"{where}.reported_temperature_c"
+                ),
             )
         )
 

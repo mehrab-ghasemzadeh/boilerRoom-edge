@@ -147,6 +147,8 @@ def _build_unit_states(
     index_key: str,
     target_type: str,
     modes: dict[Any, str],
+    setpoints: dict[int, Any] | None = None,
+    temperatures: dict[int, float | None] | None = None,
 ) -> list[dict[str, Any]]:
     states: list[dict[str, Any]] = []
 
@@ -157,13 +159,47 @@ def _build_unit_states(
         if index is None:
             continue
 
-        states.append({
+        entry: dict[str, Any] = {
             index_key: index,
             "state": "on" if relay_controller.get_state(relay_id) else "off",
             "mode": modes.get(Target(target_type, index), "automatic"),
-        })
+        }
+
+        # DEVICE.md: setpoint_c updates the unit's desired_temperature_c, and
+        # temperature_c its reported_temperature_c. Both are optional and are
+        # sent only where the device actually has the number, since a missing
+        # probe is not a reading of zero.
+        setpoint = (setpoints or {}).get(index)
+        if setpoint is not None:
+            entry["setpoint_c"] = setpoint.temperature_c
+
+        if temperatures is not None:
+            measured = _unit_temperature(cfg.get("unit"), temperatures)
+            if measured is not None:
+                entry["temperature_c"] = round(measured, 2)
+
+        states.append(entry)
 
     return states
+
+
+def _unit_temperature(
+    unit: str | None,
+    temperatures: dict[int, float | None],
+) -> float | None:
+    """
+    The temperature to report for a unit: its control probe.
+
+    The same probe the limit guard judges recovery on — outlet, else body, else
+    inlet — so the number the server stores as ``reported_temperature_c`` is
+    the one the cut-out is actually working from.
+    """
+    if not unit:
+        return None
+
+    from limits_guard import _control_temperature
+
+    return _control_temperature(unit, temperatures)
 
 
 def _device_status(sensor_readings: list[dict[str, Any]]) -> str:
@@ -184,6 +220,7 @@ async def build_telemetry_envelope(
 
     relay_controller = state.relay_controller
     modes = await state.get_modes()
+    setpoints = await state.get_setpoints()
     config_version, schedule_version = await state.get_active_versions()
     metrics = await read_system_metrics()
 
@@ -209,6 +246,8 @@ async def build_telemetry_envelope(
             index_key="boiler_index",
             target_type="boiler",
             modes=modes,
+            setpoints=setpoints,
+            temperatures=temperatures,
         )
         envelope["pump_states"] = _build_unit_states(
             relay_controller,

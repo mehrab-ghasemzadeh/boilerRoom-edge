@@ -144,6 +144,44 @@ async def _set_mode(
     )
 
 
+async def _set_temperature(
+    state,
+    target: dict[str, Any],
+    parameters: dict[str, Any],
+) -> CommandOutcome:
+    """
+    ``boiler.set_temperature`` — the cloud setting one boiler's setpoint.
+
+    Marked published straight away: it arrived *from* the server, so offering
+    it back would be a pointless round trip.
+    """
+    from setpoint_store import SetpointError
+
+    index = _target_index(target, "boiler_index")
+    if index is None:
+        return _failed("target.boiler_index is required")
+
+    if relay_for_target(Target("boiler", index)) is None:
+        return _failed(f"no relay mapped for boiler {index}")
+
+    try:
+        await state.set_setpoint(index, parameters.get("temperature_c"), published=True)
+    except SetpointError as exc:
+        return _failed(str(exc))
+
+    # The cut-out moves with the setpoint, so let the server hear about it now
+    # rather than at the next scheduled post.
+    await state.notify_state_change(f"boiler {index} setpoint (command)")
+
+    return CommandOutcome(
+        STATUS_EXECUTED,
+        reported_state={
+            "boiler_index": index,
+            "temperature_c": await state.get_setpoint(index),
+        },
+    )
+
+
 async def build_state_payload(state) -> dict[str, Any]:
     """
     The ``device.state`` body: everything this device currently believes.
@@ -169,6 +207,9 @@ async def build_state_payload(state) -> dict[str, Any]:
         "gas": {str(k): v for k, v in snapshot["gas"].items()},
         "relays": relays,
         "modes": {str(t): m for t, m in (await state.get_modes()).items()},
+        "setpoints_c": {
+            str(i): e.temperature_c for i, e in (await state.get_setpoints()).items()
+        },
         "active_config_version": config_version,
         "active_schedule_version": schedule_version,
         # A schedule edited on the device keeps the published version number —
@@ -298,6 +339,8 @@ class CommandExecutor:
             return await _switch_target(state, "boiler", "boiler_index", target, False)
         if name == "boiler.set_mode":
             return await _set_mode(state, "boiler", "boiler_index", target, parameters)
+        if name == "boiler.set_temperature":
+            return await _set_temperature(state, target, parameters)
         if name == "pump.turn_on":
             return await _switch_target(state, "pump", "pump_index", target, True)
         if name == "pump.turn_off":

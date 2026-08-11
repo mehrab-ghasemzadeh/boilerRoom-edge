@@ -623,6 +623,42 @@ class ScheduleRunner:
         await self.evaluate(state)
         return schedule
 
+    async def adopt_published_version(self, version: int, state) -> Schedule:
+        """
+        The locally edited programme has just been published by the server.
+
+        ``schedule.update_ack`` means the cloud built a schedule version out of
+        what this device sent, so the edit stops being an override and becomes
+        the room's schedule. The override file goes, and the divergence with it.
+
+        ``_applied`` is deliberately *not* cleared: only the version number
+        changed, so there is nothing to re-assert and no reason to churn relays.
+        """
+        document = dict(self._document or {})
+        document["schedule_version"] = version
+        schedule = await asyncio.to_thread(parse_schedule, document)
+
+        self._schedule = schedule
+        self._document = copy.deepcopy(document)
+        self._server_document = copy.deepcopy(document)
+        self._local_revision = 0
+        self._local_persisted = True
+
+        await state.set_active_schedule_version(version)
+
+        from schedule_editor import clear_local_schedule
+
+        try:
+            await clear_local_schedule()
+        except Exception as exc:
+            await state.log(
+                f"[schedule] Published, but could not remove the local override "
+                f"file: {exc}",
+                level=logging.WARNING,
+            )
+
+        return schedule
+
     async def restore_local(self, local, state) -> Schedule:
         """
         Re-adopt a saved override at boot, without re-saving or re-numbering it.

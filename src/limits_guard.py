@@ -59,6 +59,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from typing import Any
 
 from config import RELAYS, TEMPERATURE_SENSORS
 from errors_client import build_error, schedule_post_errors
@@ -95,6 +96,18 @@ SINGLE_PROBE_BAND_C = float(os.environ.get("BOILERROOM_SINGLE_PROBE_BAND", "3.0"
 class _CutRecord:
     reason: str
     was_on: bool
+
+
+@dataclass(frozen=True)
+class _NoLimits:
+    """Stand-in for describe() when a boiler has a setpoint but no config yet."""
+
+    max_water_temperature_c: float | None = None
+    min_water_temperature_c: float | None = None
+    max_ambient_temperature_c: float | None = None
+
+
+_NO_LIMITS = _NoLimits()
 
 
 def _boiler_targets() -> list[Target]:
@@ -175,23 +188,39 @@ def _restore_threshold(limits) -> float | None:
     return None
 
 
-def _thresholds(limits, *, single_probe: bool) -> tuple[float | None, float | None]:
+def _thresholds(
+    limits,
+    *,
+    single_probe: bool,
+    setpoint: float | None = None,
+) -> tuple[float | None, float | None]:
     """
     ``(cut_at, restore_at)`` in °C for one boiler.
 
-    ``(None, None)`` when the config gives no maximum to work from — the boiler
-    then has no over-temperature cut, which the caller reports.
+    The target is that boiler's own setpoint where it has one (DEVICE.md's
+    per-unit ``desired_temperature_c``), and the device-wide
+    ``max_water_temperature_c`` where it does not. A per-unit setpoint is the
+    more specific instruction, so it wins.
+
+    ``(None, None)`` when there is neither — the boiler then has no
+    over-temperature cut, which the caller reports.
     """
-    max_water = limits.max_water_temperature_c
-    if max_water is None:
+    target = setpoint if setpoint is not None else limits.max_water_temperature_c
+    if target is None:
         return None, None
 
     if single_probe:
-        # One probe reads as the boiler's own temperature, so the configured
-        # value is the target it is held at rather than a ceiling.
-        return max_water + SINGLE_PROBE_BAND_C, max_water - SINGLE_PROBE_BAND_C
+        # One probe reads as the boiler's own temperature, so the target is the
+        # value it is held at rather than a ceiling.
+        return target + SINGLE_PROBE_BAND_C, target - SINGLE_PROBE_BAND_C
 
-    return max_water, _restore_threshold(limits)
+    if setpoint is not None:
+        # A per-unit setpoint has no matching per-unit minimum, so recovery
+        # needs the fallback deadband; the device-wide min would be answering
+        # a different question.
+        return target, target - FALLBACK_WATER_DEADBAND_C
+
+    return target, _restore_threshold(limits)
 
 
 class LimitGuard:
@@ -221,6 +250,8 @@ class LimitGuard:
         limits = config.limits
         max_ambient = limits.max_ambient_temperature_c
 
+        setpoints = await state.get_setpoints()
+
         ambient = _ambient_temperature(temperatures)
         ambient_over = (
             max_ambient is not None and ambient is not None and ambient >= max_ambient
@@ -240,7 +271,12 @@ class LimitGuard:
             unit = f"pot_{target.index}"
             probes = _unit_probes(unit)
             single_probe = len(probes) == 1
-            cut_at, restore_at = _thresholds(limits, single_probe=single_probe)
+            entry = setpoints.get(target.index)
+            cut_at, restore_at = _thresholds(
+                limits,
+                single_probe=single_probe,
+                setpoint=entry.temperature_c if entry is not None else None,
+            )
 
             await self._report_protection(state, target, probes, cut_at)
 
@@ -432,34 +468,45 @@ class LimitGuard:
             log=state.log,
         )
 
-    def describe(self, config=None) -> list[str]:
+    def describe(self, config=None, setpoints: dict[int, Any] | None = None) -> list[str]:
         """
         Per-boiler summary for the control menu.
 
-        Shows the thresholds actually in force, since they depend on how many
-        probes each unit has — "cut at 80" and "cut at 83" sitting side by side
-        is the kind of thing an operator should be able to see rather than
-        deduce from the docs.
+        Shows the thresholds actually in force, since they depend on that
+        boiler's setpoint and on how many probes it has — "cut at 68" and
+        "cut at 83" sitting side by side is the kind of thing an operator
+        should be able to see rather than deduce from the docs.
         """
         targets = _boiler_targets()
         if not targets:
             return ["Limits: no boilers in the device mapping."]
 
         limits = getattr(config, "limits", None)
+        setpoints = setpoints or {}
         lines = ["Limits:"]
 
         for target in targets:
             probes = _unit_probes(f"pot_{target.index}")
             single_probe = len(probes) == 1
+            entry = setpoints.get(target.index)
+            setpoint = entry.temperature_c if entry is not None else None
+
+            source = (
+                f"setpoint {setpoint:.1f} °C" if setpoint is not None else "device limit"
+            )
 
             if not probes:
                 band = "NO PROBE — not protected"
-            elif limits is None:
+            elif limits is None and setpoint is None:
                 band = "no config yet"
             else:
-                cut_at, restore_at = _thresholds(limits, single_probe=single_probe)
+                cut_at, restore_at = _thresholds(
+                    limits or _NO_LIMITS,
+                    single_probe=single_probe,
+                    setpoint=setpoint,
+                )
                 if cut_at is None:
-                    band = "no max_water_temperature_c — not protected"
+                    band = "no temperature to hold — not protected"
                 else:
                     band = f"cut {cut_at:.1f} °C, restore " + (
                         f"{restore_at:.1f} °C" if restore_at is not None else "—"
@@ -474,7 +521,8 @@ class LimitGuard:
                 else "ok"
             )
             lines.append(
-                f"  {target}: {status}; probes {', '.join(sorted(probes)) or 'none'}; {band}"
+                f"  {target}: {status}; {source}; "
+                f"probes {', '.join(sorted(probes)) or 'none'}; {band}"
             )
 
         return lines

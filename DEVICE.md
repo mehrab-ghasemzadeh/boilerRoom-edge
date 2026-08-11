@@ -94,7 +94,7 @@ Both fields must be digits only.
 
 | Field | Meaning | Source |
 |--------|---------|--------|
-| Unit `desired_state` / `desired_mode` | Cloud intent | App commands (`boiler.*` / `pump.*`) |
+| Unit `desired_state` / `desired_mode` | Cloud intent | App commands (`boiler.*` / `pump.*`); `desired_state` also follows device-reported `on`/`off` |
 | Unit `reported_state` / `reported_mode` | Device truth | Telemetry `boiler_states` / `pump_states` (boiler command results may also update) |
 | Room `desired_*_version` | Version cloud wants | Config/schedule publish |
 | Device `active_*_version` | Version device reports running | Hello / telemetry |
@@ -159,7 +159,7 @@ Installer assignment (admin-only, not called by firmware):
 
 Device object fields include:
 
-`id`, `public_id`, `device_username`, `serial_number`, `boiler_room`, `status`, `presence`, `device_status`, firmware/hardware versions, presence timestamps, network (`network_type`, `rssi_dbm`), `active_config_version`, `active_schedule_version`, `capabilities`, `paired_at`, nested `boiler_units[]`, `pump_units[]`, `sensors[]`.
+`id`, `public_id`, `device_username`, `serial_number`, `boiler_room`, `status`, `presence`, `device_status`, firmware/hardware versions, presence timestamps, network (`network_type`, `rssi_dbm`), `active_config_version`, `active_schedule_version`, `capabilities`, `paired_at`, nested `boiler_units[]`, `pump_units[]`, `sensors[]`, `relays[]`.
 
 Device token may only fetch **itself**.
 
@@ -194,9 +194,21 @@ Installers must already be assigned to both the device and the target room.
   "customer_user_id": 4,
   "boiler_count": 2,
   "pump_count": 2,
-  "sensors": [
-    { "sensor_id": "inlet-1", "type": "inlet_temperature", "sequence": 1 }
-  ]
+  "publish_config": false,
+  "document": {
+    "schema_version": 2,
+    "units": {
+      "pot_1": { "name": "دیگ ۱" },
+      "pot_2": { "name": "دیگ ۲" }
+    },
+    "pumps": {
+      "pump_1": { "name": "پمپ ۱" },
+      "pump_2": { "name": "پمپ ۲" }
+    },
+    "temperature_sensors": {},
+    "gas_sensors": {},
+    "relays": {}
+  }
 }
 ```
 
@@ -204,11 +216,13 @@ Installers must already be assigned to both the device and the target room.
 |-------|--------|
 | `boiler_room_id` | Required |
 | `customer_user_id` | Optional; **ADMIN / SUPER_ADMIN only** |
-| `boiler_count` | 1–16, default 1 |
+| `boiler_count` | 1–16, default 1 (used when `document` omitted) |
 | `pump_count` | 0–16, default 0 |
-| `sensors` | Optional list |
+| `sensors` | Optional legacy list (folded into a v2 draft when `document` omitted) |
+| `document` | Optional schema v2 config document |
+| `publish_config` | If true, publish the created draft immediately |
 
-Creates/links room-owned boiler & pump units (with this device as controller where applicable) and sensors.
+Creates/links room-owned boiler & pump units (with this device as controller where applicable), creates a configuration draft (default v2 from counts when `document` omitted), and optionally publishes it.
 
 ---
 
@@ -256,7 +270,9 @@ Deduped by `message_id`.
 }
 ```
 
-`boiler_states` / `pump_states` update unit `reported_state` / `reported_mode`.
+`boiler_states` / `pump_states` update unit `reported_state` / `reported_mode`. When state is `on` or `off`, `desired_state` is synced to the same value.
+Optional `boiler_states[].temperature_c` updates `reported_temperature_c`. Optional `boiler_states[].setpoint_c` updates both `reported_temperature_c` (if measured temp omitted) and `desired_temperature_c` (device-local setpoint).
+After a successful ingest the server broadcasts `telemetry.live` on the room's app WebSocket group (sensors, boiler/pump state + temperature, derived relay state).
 
 **Response**
 
@@ -317,6 +333,7 @@ If the device is online on WS, the server pushes `command.execute` immediately (
 | `boiler.turn_on` | `{ "boiler_index": N }` | — |
 | `boiler.turn_off` | `{ "boiler_index": N }` | — |
 | `boiler.set_mode` | `{ "boiler_index": N }` | `{ "mode": "automatic" \| "manual" }` |
+| `boiler.set_temperature` | `{ "boiler_index": N }` | `{ "temperature_c": 1–80 }` |
 | `pump.turn_on` | `{ "pump_index": N }` | — |
 | `pump.turn_off` | `{ "pump_index": N }` | — |
 | `pump.set_mode` | `{ "pump_index": N }` | `{ "mode": "automatic" \| "manual" }` |
@@ -381,6 +398,8 @@ wss://br.mayanext.com/ws/v1/devices/DEV-DEMO/?token=<DEVICE_SESSION_TOKEN>
 | `command.result` | Final outcome | `command_id`, `status`, optional `reported_state` / `error` |
 | `config.result` | Config apply outcome | `config_version`, `status`: `applied` \| `failed` |
 | `schedule.result` | Schedule apply outcome | `schedule_version`, `status`: `applied` \| `failed` |
+| `schedule.update` | Device changes room schedule | `weekly_rules` (required), optional `exceptions`, `timezone` |
+| `boiler.set_temperature` | Device changes boiler setpoint | `boiler_index`, `temperature_c` (1–80) |
 | `device.error` | Raise alert | error fields |
 | `device.state` | Live dashboard push | arbitrary state object → apps as `dashboard.state_changed` |
 
@@ -414,10 +433,100 @@ wss://br.mayanext.com/ws/v1/devices/DEV-DEMO/?token=<DEVICE_SESSION_TOKEN>
 |------|---------|
 | `device.hello_ack` | `connection_id`, `server_time`, `desired_config_version`, `desired_schedule_version`, `heartbeat_interval_seconds` |
 | `command.execute` | `{ command_id, name, target, parameters }` |
-| `config.apply` | Config document + `config_version` |
+| `config.apply` | Schema v2 config document (`units`, `temperature_sensors`, `gas_sensors`, `relays`, …) + `config_version` |
 | `schedule.apply` | `{ schedule_version, timezone, weekly_rules, exceptions }` |
+| `schedule.update_ack` | Result of device `schedule.update` (`ok`, `schedule_version` or `error`) |
+| `boiler.set_temperature_ack` | Result of device `boiler.set_temperature` (`ok`, `boiler_index`, `temperature_c` or `error`) |
+| `boiler.apply_temperature` | Other room devices: apply setpoint from a peer device (`boiler_index`, `temperature_c`) |
 
 After hello, the server may reconcile: push missing config/schedule and re-dispatch non-expired commands in `queued` / `sent`.
+
+**Device updates schedule (device → server)**
+
+```json
+{
+  "v": 1,
+  "type": "schedule.update",
+  "event_id": "evt-sch-set-1",
+  "payload": {
+    "timezone": "Asia/Tehran",
+    "weekly_rules": [
+      {
+        "days": ["saturday", "sunday", "monday", "tuesday", "wednesday"],
+        "start": "06:00",
+        "end": "22:00",
+        "state": "on",
+        "targets": [
+          { "type": "boiler", "index": 1 },
+          { "type": "pump", "index": 1 }
+        ]
+      }
+    ],
+    "exceptions": []
+  }
+}
+```
+
+Server replies:
+
+```json
+{
+  "v": 1,
+  "type": "schedule.update_ack",
+  "correlation_id": "evt-sch-set-1",
+  "payload": {
+    "ok": true,
+    "schedule_version": 3,
+    "timezone": "Asia/Tehran",
+    "desired_schedule_version": 3,
+    "applied_schedule_version": 3
+  }
+}
+```
+
+On success the cloud:
+
+1. Creates a new schedule version for the paired boiler room and sets it desired + applied.
+2. Sets the reporting device’s `active_schedule_version`.
+3. Pushes `schedule.apply` to **other** devices on the same room (not back to the sender).
+4. Broadcasts `sync.status_changed` (`kind: "schedule"`) to apps.
+
+**Device sets boiler temperature (device → server)**
+
+```json
+{
+  "v": 1,
+  "type": "boiler.set_temperature",
+  "event_id": "evt-temp-1",
+  "payload": {
+    "boiler_index": 1,
+    "temperature_c": 65.0
+  }
+}
+```
+
+Server replies:
+
+```json
+{
+  "v": 1,
+  "type": "boiler.set_temperature_ack",
+  "correlation_id": "evt-temp-1",
+  "payload": {
+    "ok": true,
+    "boiler_index": 1,
+    "temperature_c": 65.0
+  }
+}
+```
+
+On success the cloud:
+
+1. Sets the boiler unit’s `desired_temperature_c` and `reported_temperature_c` (1–80 °C).
+2. Pushes `boiler.apply_temperature` to **other** devices on the same room (not back to the sender).
+3. Broadcasts `telemetry.live` to apps so UIs refresh the setpoint.
+
+Devices may also report a local setpoint via HTTP telemetry `boiler_states[].setpoint_c` (updates desired) distinct from measured `temperature_c` (reported only).
 
 **Hello ack example**
 
@@ -504,7 +613,31 @@ Not used by firmware; apps listen for live updates.
 - **Auth:** user JWT (`Bearer` or `?token=`).
 - Joins `boiler_room_<id>` for accessible rooms + `user_<id>`.
 - **Send:** `{ "type": "ping" }` → `{ "type": "pong", ... }`.
-- **Receive:** `command.status_changed`, `sync.status_changed`, `dashboard.state_changed`, `device.presence_changed`, `alert.opened`, `alert.updated`.
+- **Receive:** `command.status_changed`, `sync.status_changed`, `dashboard.state_changed`, `telemetry.live`, `device.presence_changed`, `alert.opened`, `alert.updated`.
+
+`telemetry.live` is pushed after HTTP telemetry ingest (and after successful command execution / `device.state`). Payload:
+
+```json
+{
+  "device_id": "<public_id>",
+  "boiler_room_id": 1,
+  "captured_at": "2026-08-11T12:00:00Z",
+  "sensor_readings": [
+    { "sensor_uid": "inlet-1", "type": "boiler_input_water", "value": 42.5, "unit": "C", "status": "ok", "boiler_unit": 1 }
+  ],
+  "boiler_states": [
+    { "boiler_index": 1, "state": "on", "mode": "manual", "temperature_c": 65.0 }
+  ],
+  "pump_states": [
+    { "pump_index": 1, "state": "off", "mode": "auto" }
+  ],
+  "relays": [
+    { "relay_key": "rly_1", "gpio": 17, "role": "pot", "boiler_unit": 1, "reported_state": "on" }
+  ]
+}
+```
+
+Relay `reported_state` is derived from the linked boiler/pump unit (GPIO mapping has no separate live field).
 
 ---
 
@@ -523,6 +656,18 @@ Not used by firmware; apps listen for live updates.
 1. Admin/app publishes schedule on the boiler room.
 2. Device (after hello or live) receives `schedule.apply`.
 3. Device replies `schedule.result` with `status: "applied"`.
+
+### Device changes schedule
+
+1. Paired device sends `schedule.update` with `weekly_rules` (and optional `exceptions` / `timezone`).
+2. Server replies `schedule.update_ack` with the new `schedule_version`.
+3. Other room devices receive `schedule.apply`; apps receive `sync.status_changed`.
+
+### Device changes boiler temperature
+
+1. Paired device sends `boiler.set_temperature` with `boiler_index` + `temperature_c` (1–80).
+2. Server replies `boiler.set_temperature_ack`.
+3. Other room devices receive `boiler.apply_temperature`; apps receive `telemetry.live`.
 
 ---
 

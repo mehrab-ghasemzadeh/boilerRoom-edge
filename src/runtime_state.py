@@ -56,6 +56,8 @@ class RuntimeState:
 
         self._control_lock = asyncio.Lock()
         self._modes: dict[Any, str] = {}
+        # boiler index -> Setpoint. See the setpoint section below.
+        self._setpoints: dict[int, Any] = {}
         self._limit_blocks: dict[Any, str] = {}
         self.device_config = None
 
@@ -172,6 +174,89 @@ class RuntimeState:
     async def get_modes(self) -> dict[Any, str]:
         async with self._control_lock:
             return dict(self._modes)
+
+    # -- per-boiler temperature setpoints ------------------------------------
+    #
+    # DEVICE.md gives every boiler its own desired_temperature_c. Where one is
+    # set it is what the limit guard holds that boiler at; where it is not, the
+    # device-wide max_water_temperature_c still applies. Persisted like modes,
+    # and carrying whether the server has acknowledged it, so a setpoint made
+    # during an outage is published rather than lost.
+
+    async def set_setpoint(
+        self,
+        index: int,
+        temperature: float,
+        *,
+        published: bool = False,
+    ) -> None:
+        from setpoint_store import Setpoint, validate
+
+        entry = Setpoint(validate(temperature), published)
+        async with self._control_lock:
+            if self._setpoints.get(index) == entry:
+                return  # no change, no write
+            self._setpoints[index] = entry
+            snapshot = dict(self._setpoints)
+
+        await self._persist_setpoints(snapshot)
+
+    async def mark_setpoint_published(self, index: int) -> None:
+        """Record that the server has accepted this boiler's setpoint."""
+        from setpoint_store import Setpoint
+
+        async with self._control_lock:
+            entry = self._setpoints.get(index)
+            if entry is None or entry.published:
+                return
+            self._setpoints[index] = Setpoint(entry.temperature_c, True)
+            snapshot = dict(self._setpoints)
+
+        await self._persist_setpoints(snapshot)
+
+    async def clear_setpoint(self, index: int) -> None:
+        """Drop a boiler's setpoint, handing it back to the device-wide limit."""
+        async with self._control_lock:
+            if self._setpoints.pop(index, None) is None:
+                return
+            snapshot = dict(self._setpoints)
+
+        await self._persist_setpoints(snapshot)
+
+    async def restore_setpoints(self, setpoints: dict[int, Any]) -> None:
+        """Load setpoints from the cache at boot, without writing them back."""
+        async with self._control_lock:
+            self._setpoints.update(setpoints)
+
+    async def _persist_setpoints(self, setpoints: dict[int, Any]) -> None:
+        from setpoint_store import save_setpoints
+
+        try:
+            await save_setpoints(setpoints)
+        except Exception as exc:
+            # A cache that cannot be written must not fail the change that set
+            # the temperature; the setpoint is already in effect.
+            await self.log(
+                f"[setpoint] Could not save setpoints: {exc}", level=logging.WARNING
+            )
+
+    async def get_setpoint(self, index: int) -> float | None:
+        async with self._control_lock:
+            entry = self._setpoints.get(index)
+        return entry.temperature_c if entry is not None else None
+
+    async def get_setpoints(self) -> dict[int, Any]:
+        async with self._control_lock:
+            return dict(self._setpoints)
+
+    async def unpublished_setpoints(self) -> dict[int, float]:
+        """Setpoints the server has not acknowledged, oldest boiler first."""
+        async with self._control_lock:
+            return {
+                index: entry.temperature_c
+                for index, entry in sorted(self._setpoints.items())
+                if not entry.published
+            }
 
     # -- safety cut-outs (set by the limit guard, respected by everything) ----
 
