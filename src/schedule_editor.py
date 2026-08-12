@@ -67,6 +67,11 @@ _DAY_ALIASES = {name[:3]: name for name in DAY_NAMES}
 # on the wrong days.
 _DAY_GROUPS = {"all": DAY_NAMES, "daily": DAY_NAMES, "everyday": DAY_NAMES}
 
+# ISO numbering, 1 = Monday. The device's keypad has no letters, so every one
+# of these parsers takes a digit form as well as the words — see the note at
+# the top of control_menu. "0" is every day, the one value ISO leaves free.
+_DAY_NUMBERS = {str(number): name for number, name in enumerate(DAY_NAMES, start=1)}
+
 
 class ScheduleEditError(ValueError):
     """Raised when an operator's input cannot be turned into a schedule edit."""
@@ -89,22 +94,41 @@ def _utc_now_iso() -> str:
 
 
 def parse_days(raw: str) -> list[str]:
-    """``"mon,tue"`` or ``"all"`` -> canonical day names."""
+    """
+    ``"mon,tue"``, ``"12"`` or ``"all"`` -> canonical day names.
+
+    Digits are ISO weekday numbers and need no separators: ``135`` is Monday,
+    Wednesday and Friday, which is three keypresses on the device's keypad
+    rather than eleven.
+    """
     text = raw.strip().lower()
     if not text:
         raise ScheduleEditError("no days given")
-    if text in _DAY_GROUPS:
-        return list(_DAY_GROUPS[text])
+    if text in _DAY_GROUPS or text == "0":
+        return list(DAY_NAMES)
 
     days: list[str] = []
     for part in text.replace(" ", "").split(","):
         if not part:
             continue
+
+        if part.isdigit():
+            for digit in part:
+                name = _DAY_NUMBERS.get(digit)
+                if name is None:
+                    raise ScheduleEditError(
+                        f"there is no day {digit} — days are 1 (Monday) to "
+                        "7 (Sunday), or 0 for every day"
+                    )
+                if name not in days:
+                    days.append(name)
+            continue
+
         name = _DAY_ALIASES.get(part[:3])
         if name is None or not name.startswith(part):
             raise ScheduleEditError(
                 f"unknown day {part!r} — use three letters or the full name "
-                f"({', '.join(n[:3] for n in DAY_NAMES)}), or 'all'"
+                f"({', '.join(n[:3] for n in DAY_NAMES)}), a number 1-7, or 'all'"
             )
         if name not in days:
             days.append(name)
@@ -115,16 +139,27 @@ def parse_days(raw: str) -> list[str]:
 
 
 def parse_time_text(raw: str, field: str) -> str:
-    """``"7:30"`` -> ``"07:30"``."""
+    """
+    ``"7:30"``, ``"0730"`` or ``"730"`` -> ``"07:30"``.
+
+    The bare digit forms are what the keypad can type: it has no colon.
+    """
     text = raw.strip()
     if not text:
         raise ScheduleEditError(f"{field}: a time is required, as HH:MM")
-    for fmt in ("%H:%M", "%H:%M:%S"):
+
+    # Three digits is H:MM — 730 is half past seven, not 73 o'clock.
+    if text.isdigit() and len(text) == 3:
+        text = "0" + text
+
+    for fmt in ("%H:%M", "%H:%M:%S", "%H%M"):
         try:
             return datetime.datetime.strptime(text, fmt).strftime("%H:%M")
         except ValueError:
             continue
-    raise ScheduleEditError(f"{field}: cannot read {text!r} as a HH:MM time")
+    raise ScheduleEditError(
+        f"{field}: cannot read {raw.strip()!r} as a time — use HH:MM or HHMM"
+    )
 
 
 def parse_state_text(raw: str) -> bool:
@@ -138,22 +173,43 @@ def parse_state_text(raw: str) -> bool:
 
 def parse_date_text(raw: str, *, today: datetime.date) -> str:
     """
-    ``"today"``, ``"tomorrow"`` or ``"YYYY-MM-DD"`` -> an ISO date.
+    ``"today"``, ``"tomorrow"``, ``"YYYY-MM-DD"``, ``"YYYYMMDD"`` or ``"MMDD"``
+    -> an ISO date.
 
     ``today`` is passed in rather than read from the clock here: exceptions are
     matched in the *schedule's* timezone, and a Pi running on UTC under an
-    Asia/Tehran schedule can already be on the next day there.
+    Asia/Tehran schedule can already be on the next day there. It is also what
+    ``MMDD`` takes its year from, for the same reason.
+
+    ``0`` and ``1`` are today and tomorrow, which covers nearly every exception
+    anyone sets standing in the boiler room, on a keypad with no letters.
     """
     text = raw.strip().lower()
-    if text in ("today", "t"):
+    if text in ("today", "t", "0"):
         return today.isoformat()
-    if text in ("tomorrow", "tom"):
+    if text in ("tomorrow", "tom", "1"):
         return (today + datetime.timedelta(days=1)).isoformat()
+
+    if text.isdigit() and len(text) in (4, 8):
+        # MMDD is this year in the schedule's timezone; YYYYMMDD is explicit.
+        # Built by hand rather than by strptime, which would resolve MMDD
+        # against year 1900 and so refuse 29 February in a year that has one.
+        year, month, day = (
+            (today.year, int(text[:2]), int(text[2:]))
+            if len(text) == 4
+            else (int(text[:4]), int(text[4:6]), int(text[6:]))
+        )
+        try:
+            return datetime.date(year, month, day).isoformat()
+        except ValueError as exc:
+            raise ScheduleEditError(f"{raw.strip()!r} is not a real date") from exc
+
     try:
         return datetime.date.fromisoformat(text).isoformat()
     except ValueError as exc:
         raise ScheduleEditError(
-            f"cannot read {raw.strip()!r} as a date — use YYYY-MM-DD, 'today' or 'tomorrow'"
+            f"cannot read {raw.strip()!r} as a date — use YYYY-MM-DD, YYYYMMDD, "
+            "MMDD, 0 for today or 1 for tomorrow"
         ) from exc
 
 

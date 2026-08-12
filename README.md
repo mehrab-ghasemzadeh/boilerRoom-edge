@@ -307,6 +307,51 @@ Supported commands: `boiler.turn_on/off`, `boiler.set_mode`,
 Command outcomes are cached by `command_id` (last 64) and replayed rather than
 re-executed, because the server re-dispatches queued commands after every hello.
 
+### Reconciliation after hello
+
+A device is expected to run through outages, so the two sides drift apart on
+purpose: the boiler room keeps working from its caches and an operator can
+change things at the panel, while someone in the app changes the same things.
+When the link comes back, `reconcile.py` decides whose version stands. It runs
+alongside the listen loop — the pushes it waits for arrive there — and one step
+failing does not stop the rest.
+
+| # | Step | Rule |
+|---|------|------|
+| 1 | Config and schedule versions | `hello_ack` names the versions the server wants; wait up to 20 s for it to push anything newer |
+| 2 | Device record | Re-fetch `GET /devices/<id>` — modes, setpoints, calibration, enabled probes, wiring |
+| 3 | Local changes | Publish whatever this device changed offline and the server has not heard about |
+| 4 | Thermal backlog | Drain the telemetry outbox, oldest first, within a 60 s budget |
+| 5 | Relay state | Assert where the relays actually are |
+
+**What "newer" can mean.** Only schedule and config are datable: they carry
+integer versions minted by the server, so newest-wins is a real comparison.
+Modes and setpoints carry no version and no timestamp anywhere — not in the
+unit record, not in telemetry, not on the device — so for those the rule is the
+one thing that *is* known: a change this device has not managed to send yet is
+newer by definition, because the server has never heard of it. It wins and is
+published; anything else, the record wins. If the platform ever adds an
+`updated_at` to a unit, `record_sync.adopt_record_modes` is where that becomes
+a real comparison.
+
+A device can never legitimately hold a *higher* version than the server, since
+the server mints them — that means a rollback or a lost version, and is
+reported rather than fought. The real "the device has something newer" case is
+a local edit, which keeps the published version number on purpose.
+
+**Step order is the point.** Take the case this exists for: the device edited
+its schedule at 12:05, the server published a newer one at 18:00. Publishing
+the local edit first would make the stale 12:05 edit the room's real schedule
+and destroy the 18:00 one — the device winning by speaking first rather than by
+being right. So versions settle first, the newer push supersedes and deletes
+the local override, and only what survives that is offered upstream.
+
+Relay wiring, calibration and enabled probes are server-owned — the device
+cannot author them, so the record simply wins. Relay on/off is the opposite:
+the device owns it physically and DEVICE.md has `reported_state` come from
+telemetry and nothing else, so step 5 asserts rather than asks. The cloud's
+`desired_state` does not get to overrule a safety cut.
+
 ---
 
 ## Schedule evaluation
@@ -445,13 +490,42 @@ the programme:
 
 Set either from the server (`boiler.set_mode` / `pump.set_mode`) or **on the
 device** through control-menu option 7 — an operator standing in the boiler
-room should not need the cloud to take a boiler off the schedule. Both paths do
-the same thing, persist the same way, and are reported to the server within a
-second or two. Switching back to `automatic` calls `forget()` so the schedule
+room should not need the cloud to take a boiler off the schedule. Both paths
+drive the unit identically, persist the same way, and are reported to the
+server within a second or two. Switching back to `automatic` calls `forget()` so the schedule
 re-asserts on the next tick rather than waiting for the next start/end
 boundary. The limit guard respects the mode too:
 after a cut clears, a manual unit is put back exactly where the operator left
 it, while an automatic one is handed to the schedule.
+
+#### Keeping modes in step with the server
+
+Modes move in both directions, and neither uses the same channel as everything
+else.
+
+**Down — the server's mode reaches the device through `GET /devices/<id>`.**
+Nothing on the WebSocket carries current modes: `hello_ack` has versions and a
+heartbeat interval, and after hello the server re-dispatches only commands
+still `queued`/`sent`, so a mode whose command completed long ago never
+arrives again. Each device-record poll therefore adopts `desired_mode` — which
+is what makes a device that boots hours later come up on the modes the app
+shows, instead of defaulting every unit to `automatic`.
+
+**Up — a mode set here is reported with `boiler.set_mode` / `pump.set_mode`.**
+Telemetry's `boiler_states` / `pump_states` already settle `reported_mode`;
+this is what is meant to settle `desired_mode`. It is sent fire-and-forget and
+retried on every reconnect until acknowledged.
+
+When the two disagree:
+
+| Situation | Winner |
+|---|---|
+| A local change not yet acknowledged | **the device** — it is newer than anything the server can know about, and is still being offered upstream |
+| Anything else | **the record** — our view has been confirmed, so a difference means someone changed it in the app |
+
+A standoff is logged at WARNING each poll, and clears itself the moment the two
+agree. `desired_state` is deliberately **not** adopted: the schedule and the
+limit guard own relay state, and a stale desired on/off would fight them.
 
 **Modes survive a restart.** They are written to `mode_cache.json` whenever one
 changes — a rare, operator-driven event — and restored before the first
@@ -968,8 +1042,9 @@ card when the fault is something a restart cannot fix.
                               0) Quit
 ```
 
-Sensor polling and the WebSocket keep running while the menu is open — terminal
-input is read in a worker thread.
+Sensor polling and the WebSocket keep running while the menu is open — input is
+read off the event loop, on a worker thread for the keyboard and on the
+keypad's own scanning thread for the matrix.
 
 Option 3 shows the active config, the limits, which boilers are currently cut,
 and the state of the reading database and the telemetry outbox. Option 5 shows
@@ -984,6 +1059,86 @@ Option 9 edits the heating programme itself — see
 [Changing the programme on the device](#changing-the-programme-on-the-device) —
 and option 10 the boiler temperatures, see
 [Per-boiler temperatures](#per-boiler-temperatures).
+
+### The keypad
+
+On the installed hardware the menu is answered on a 4x4 matrix keypad wired to
+the header, not on a keyboard — there is no terminal in a boiler room, and
+under systemd there is not even a TTY. Which device the menu reads from follows
+`USE_MOCK_HARDWARE`, exactly like the relays and the sensor readers: the
+keyboard on the bench, the keypad on the Pi.
+
+Both hand back a whole line, so there is one menu rather than a keyboard menu
+and a keypad menu drifting apart. Keys go into the answer as they are pressed;
+`enter` accepts it, `del` rubs out the last character, and `cancel` abandons it
+— which every prompt already reads as "back", so there is no way to get stuck
+in one with no keyboard to hand.
+
+Wiring, and the default key table:
+
+| | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| **A** (GPIO 17) | 1 | 2 | 3 | enter |
+| **B** (GPIO 27) | 4 | 5 | 6 | del |
+| **C** (GPIO 22) | 7 | 8 | 9 | cancel |
+| **D** (GPIO 5) | . | 0 | , | - |
+
+Columns 1–4 are GPIO 6, 13, 19 and 26.
+
+Scanning drives the row pins, so a pin shared with a relay means **a keypress
+switches a boiler**. The keypad checks its pins against the live mapping before
+claiming them and refuses to start if any is already spoken for, naming the
+relay. That is a hard refusal, not a warning: the menu falls back to the
+keyboard, and on a device with no TTY that means no menu — which is the right
+trade against a keypad that can fire a boiler.
+
+> **This installation currently trips that check.** The relay pins above are
+> the documented wiring, but the server record hands out GPIO 17–21, so
+> `rly_1` (17) collides with row A and `rly_3` (19) with column 3. Either
+> correct the relay GPIO in the device record, or move the keypad with
+> `BOILERROOM_KEYPAD_ROWS` / `_COLS`.
+
+**A key is identified by its position in the matrix, never by what is printed
+on the cap**, because the print varies between keypads that are wired
+identically — a calculator-style pad usually puts 7/8/9 on the top row. Treat
+the table above as a starting point and confirm it:
+
+```bash
+python src/keypad.py --test     # prints the position of each key as you press it
+```
+
+then set `BOILERROOM_KEYPAD_LAYOUT` to match. `BOILERROOM_KEYPAD_ROWS` and
+`_COLS` move the pins; swapping those two lines transposes the layout rather
+than breaking it, which is the usual fix when every key comes out wrong.
+
+Ten digits leaves six keys, which is exactly what the menus need: accept, rub
+out, cancel, `.` for a decimal temperature, `,` for a list of units and `-`,
+which is what clears a limit. Everything that used to want free text now takes
+a digit form as well as the words:
+
+| Prompt | Keyboard | Keypad |
+|---|---|---|
+| Days | `mon,tue` | `12` — 1 is Monday, 7 Sunday, 0 every day |
+| Time | `07:30` | `0730`, or `730` |
+| Date | `2026-12-25`, `tomorrow` | `1225`, `20261225`, `0` today, `1` tomorrow |
+| On/off | `on` / `off` | `1` / `0` |
+| Yes/no | `y` / `n` | `1` / `0` |
+| Which units | `1,3` or `all` | `13`, or `0` for all |
+| Clear a limit | `none` | `-` |
+
+A run of digits is only read as a list where the number is not itself a
+position, so an installation with thirteen units still reads `13` as the
+thirteenth.
+
+On the bench, `BOILERROOM_KEYPAD_EMULATE=on` puts what you type through the
+same key table and refuses anything the keypad has no key for. Nothing about
+the flow changes — the point is to find a prompt the device cannot answer
+before the code is on a device with no keyboard attached.
+
+A keypad that will not start — miswired, pins already claimed, no permission —
+is logged at ERROR and the menu falls back to the keyboard, if there is one.
+It never stops the agent: the boilers are running a heating programme and the
+server can still drive them, and what is lost is the local menu.
 
 ---
 
@@ -1009,7 +1164,11 @@ and option 10 the boiler temperatures, see
 | `telemetry_client.py` | Telemetry envelope construction and POST |
 | `errors_client.py` | Fault detection and error reporting |
 | `runtime_state.py` | Shared state across tasks, with locks |
-| `control_menu.py` | Interactive terminal menu |
+| `reconcile.py` | Post-hello reconciliation: versions, record, backlog, relay state |
+| `record_sync.py` | Adopting the server record — modes, setpoints, calibration, wiring |
+| `control_menu.py` | Interactive control menu, on whichever input device is fitted |
+| `keypad.py` | GPIO matrix keypad: pin setup, scanning thread, bring-up test |
+| `keypad_layout.py` | Keypad pins, key table and line editor — no hardware imports |
 | `mapping.py`, `mapping_*.py`, `config.py` | Device mapping load, validation, lookup |
 | `load_env.py` | Minimal `.env` reader (stdlib only) |
 | `temperature_reader.py`, `gas_reader.py`, `relay_controller.py` | Hardware I/O |
@@ -1038,6 +1197,12 @@ requires a user JWT or an installer/admin role.
 
 Outstanding:
 
+- **The keypad has not been run against real hardware.** The scanner is tested
+  against a simulated header — pin directions, pull-ups, row-by-row
+  identification, debounce, held keys, two-key ghost rejection — but simulated
+  pins cannot tell you the key table matches the caps on *your* keypad, and
+  they cannot bounce the way a membrane does. Run `python src/keypad.py --test`
+  on the device first and set `BOILERROOM_KEYPAD_LAYOUT` from what it prints.
 - **No gas threshold logic.** Gas readings are logged and transmitted, but no
   threshold drives the `alarm` relay or `gas_valve`.
 - **A changed mapping needs a restart.** Relay GPIO pins are configured once at

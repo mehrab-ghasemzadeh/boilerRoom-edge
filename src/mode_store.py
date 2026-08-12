@@ -13,11 +13,15 @@ schedule evaluation, so a manual unit is left alone from the very first tick.
 
 Modes are per unit by design. There is no device-wide switch: boiler 1 can be
 under maintenance while boiler 2 follows the programme.
+
+Each entry also records whether the server has acknowledged it, so a mode set
+during an outage is reported on the next connection rather than staying local.
 """
 
 from __future__ import annotations
 
 import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +35,14 @@ MODE_CACHE_PATH = env_path("BOILERROOM_MODE_CACHE", "mode_cache.json")
 
 VALID_MODES = ("automatic", "manual")
 VALID_TARGET_TYPES = ("boiler", "pump")
+
+
+@dataclass(frozen=True)
+class ModeEntry:
+    """One unit's control mode, and whether the server knows about it."""
+
+    mode: str
+    published: bool = False
 
 
 def _key(target: Any) -> str:
@@ -47,7 +59,31 @@ def _parse_key(raw: str) -> tuple[str, int] | None:
         return None
 
 
-async def load_modes(path: Path | None = None) -> dict[Any, str]:
+def _parse_entry(raw: Any) -> ModeEntry | None:
+    """
+    Accept the stored object form, and a bare string from an older cache.
+
+    A bare string is treated as *published*. Such an entry is old steady state,
+    not a change waiting to be sent, and the two get very different treatment:
+    an unpublished mode is reported upstream and outranks the server's
+    ``desired_mode`` until it is acknowledged. Marking a stale cached value
+    unpublished would have this device report it on the next connection and
+    overwrite whatever an app had set in the meantime — losing the newer
+    intent to an older one.
+    """
+    if isinstance(raw, str):
+        mode, published = raw, True
+    elif isinstance(raw, dict):
+        mode, published = raw.get("mode"), bool(raw.get("published", False))
+    else:
+        return None
+
+    if mode not in VALID_MODES:
+        return None
+    return ModeEntry(mode, published)
+
+
+async def load_modes(path: Path | None = None) -> dict[Any, ModeEntry]:
     """
     Restore saved modes, keyed by ``Target``.
 
@@ -66,27 +102,31 @@ async def load_modes(path: Path | None = None) -> dict[Any, str]:
         _log.warning("Mode cache has no 'modes' object — ignoring it")
         return {}
 
-    modes: dict[Any, str] = {}
-    for raw_key, mode in raw_modes.items():
+    modes: dict[Any, ModeEntry] = {}
+    for raw_key, raw_entry in raw_modes.items():
         parsed = _parse_key(str(raw_key))
         if parsed is None:
             _log.warning("Ignoring unusable mode cache entry %r", raw_key)
             continue
-        if mode not in VALID_MODES:
-            _log.warning("Ignoring mode %r for %s — not a known mode", mode, raw_key)
+        entry = _parse_entry(raw_entry)
+        if entry is None:
+            _log.warning("Ignoring mode %r for %s — not a known mode", raw_entry, raw_key)
             continue
         kind, index = parsed
-        modes[Target(kind, index)] = mode
+        modes[Target(kind, index)] = entry
 
     return modes
 
 
-async def save_modes(modes: dict[Any, str], path: Path | None = None) -> None:
+async def save_modes(modes: dict[Any, ModeEntry], path: Path | None = None) -> None:
     """Persist the current modes. Written atomically, like the other caches."""
     payload = {
         "saved_at": datetime.datetime.now(datetime.UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
-        "modes": {_key(target): mode for target, mode in sorted(modes.items(), key=str)},
+        "modes": {
+            _key(target): {"mode": entry.mode, "published": entry.published}
+            for target, entry in sorted(modes.items(), key=str)
+        },
     }
     await write_json(path or MODE_CACHE_PATH, payload)

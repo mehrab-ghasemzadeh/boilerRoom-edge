@@ -3,6 +3,17 @@ Interactive control menu — runs concurrently with the sensor loop.
 
 Blocking terminal input runs in a worker thread via asyncio.to_thread so the
 event loop keeps polling sensors and posting telemetry.
+
+Answers come from an input device rather than from ``input()`` directly: the
+keyboard on the bench, the GPIO matrix keypad on the installed hardware, chosen
+by USE_MOCK_HARDWARE the same way the relays and sensor readers are. Both hand
+back a whole line, so there is one menu rather than a keyboard menu and a
+keypad menu drifting apart.
+
+Every prompt therefore has to be answerable from sixteen keys. The menus were
+already numeric; what needed work was the free text around them, and the
+parsers now take a digit form of each — days as 1-7, a time as HHMM, a date as
+YYYYMMDD — alongside the words. See ``keypad_layout`` for the key table.
 """
 
 from __future__ import annotations
@@ -103,10 +114,42 @@ SCHEDULE_MENU = """
 > """
 
 
-async def _prompt(text: str) -> str:
-    import asyncio
+# The device answers are read from. A module-level handle, like the schedule
+# and config stores, so the twenty-odd call sites of _prompt keep their
+# signature instead of threading it through every menu function.
+_input_device = None
 
-    return (await asyncio.to_thread(input, text)).strip()
+
+def set_input_device(device) -> None:
+    global _input_device
+    _input_device = device
+
+
+def input_device():
+    """The active input device, defaulting to the keyboard."""
+    if _input_device is None:
+        from mock_keypad import MockKeypad
+
+        set_input_device(MockKeypad())
+    return _input_device
+
+
+async def _prompt(text: str) -> str:
+    return (await input_device().read_line(text)).strip()
+
+
+def _is_yes(answer: str) -> bool:
+    """
+    Whether a yes/no prompt was answered yes.
+
+    ``1`` and ``0`` are here because the keypad has no letters — the same
+    reason parse_state_text has taken them since it was written.
+    """
+    return answer.strip().lower() in ("y", "yes", "1", "on")
+
+
+def _is_no(answer: str) -> bool:
+    return answer.strip().lower() in ("n", "no", "0", "off")
 
 
 async def _show_last_readings(state: RuntimeState) -> None:
@@ -361,15 +404,15 @@ async def _mode_menu(state: RuntimeState) -> None:
 
     current = modes.get(target, "automatic")
     answer = await _prompt(
-        f"  {target} is {current}. Set to [a]utomatic or [m]anual? (empty = back): "
+        f"  {target} is {current}. Set to 1) automatic or 2) manual? (empty = back): "
     )
     choice = answer.strip().lower()
     if not choice:
         await state.echo("")
         return
-    if choice in ("a", "auto", "automatic"):
+    if choice in ("1", "a", "auto", "automatic"):
         mode = "automatic"
-    elif choice in ("m", "man", "manual"):
+    elif choice in ("2", "m", "man", "manual"):
         mode = "manual"
     else:
         await state.echo("[menu] Invalid mode.\n")
@@ -402,6 +445,18 @@ async def _mode_menu(state: RuntimeState) -> None:
     await state.log(f"[menu] {target} set to {mode} by operator")
     # Modes appear in telemetry, so report this without waiting for the cycle.
     await state.notify_state_change(f"{target} mode {mode} (operator)")
+
+    # Telemetry settles reported_mode; this is what is meant to settle
+    # desired_mode. Fire and forget — see report_unit_mode.
+    from ws_client import report_unit_mode
+
+    if await report_unit_mode(state, target, mode):
+        await state.echo("[menu] Reported to the server.\n")
+    else:
+        await state.echo(
+            "[menu] Offline — the mode will be reported when the device "
+            "reconnects.\n"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -473,16 +528,26 @@ async def _select_schedule_targets(state: RuntimeState) -> list[Target] | None:
     for position, target in enumerate(targets, start=1):
         await state.echo(f"    {position}) {str(target):<10} relay {relay_for_target(target)}")
 
-    raw = await _prompt("  Which? (e.g. 1,3 or 'all', empty = cancel): ")
+    raw = await _prompt("  Which? (e.g. 1,3 or 13; 0 = all, empty = cancel): ")
     if not raw:
         return None
-    if raw.strip().lower() == "all":
+
+    text = raw.replace(" ", "").lower()
+    if text in ("all", "0"):
         return targets
 
+    parts = [part for part in text.split(",") if part]
+
+    # A run of digits with no separators — "13" for units 1 and 3 — because the
+    # keypad's comma is one more key to find in a boiler room. Only when the
+    # number is not itself a position on the list, so an installation with
+    # thirteen units still reads "13" as the thirteenth.
+    if len(parts) == 1 and parts[0].isdigit() and len(parts[0]) > 1:
+        if not 1 <= int(parts[0]) <= len(targets):
+            parts = list(parts[0])
+
     chosen: list[Target] = []
-    for part in raw.replace(" ", "").split(","):
-        if not part:
-            continue
+    for part in parts:
         try:
             position = int(part)
         except ValueError:
@@ -583,11 +648,13 @@ async def _add_weekly_rule(state: RuntimeState) -> None:
         return
 
     try:
-        days = parse_days(await _prompt("  Days? (mon,tue,... or 'all'): "))
-        start = parse_time_text(await _prompt("  Start time HH:MM: "), "start")
-        end = parse_time_text(await _prompt("  End time HH:MM: "), "end")
+        days = parse_days(
+            await _prompt("  Days? (1=Mon .. 7=Sun, e.g. 135; 0 = every day): ")
+        )
+        start = parse_time_text(await _prompt("  Start time (HHMM): "), "start")
+        end = parse_time_text(await _prompt("  End time (HHMM): "), "end")
         turn_on = parse_state_text(
-            await _prompt("  Switch them [on] or [off] in that window? ")
+            await _prompt("  Switch them on or off in that window? [1 = on, 0 = off]: ")
         )
         edited = add_weekly_rule(
             document,
@@ -645,16 +712,18 @@ async def _add_exception(state: RuntimeState) -> None:
 
     try:
         date = parse_date_text(
-            await _prompt("  Date? (YYYY-MM-DD, 'today' or 'tomorrow'): "),
+            await _prompt("  Date? (0 = today, 1 = tomorrow, or MMDD / YYYYMMDD): "),
             today=_schedule_today(),
         )
-        turn_on = parse_state_text(await _prompt("  Force them [on] or [off]? "))
+        turn_on = parse_state_text(
+            await _prompt("  Force them on or off? [1 = on, 0 = off]: ")
+        )
 
-        all_day = (await _prompt("  All day? [Y/n]: ")).strip().lower() not in ("n", "no")
+        all_day = not _is_no(await _prompt("  All day? [0 = no, anything else = yes]: "))
         start = end = None
         if not all_day:
-            start = parse_time_text(await _prompt("  Start time HH:MM: "), "start")
-            end = parse_time_text(await _prompt("  End time HH:MM: "), "end")
+            start = parse_time_text(await _prompt("  Start time (HHMM): "), "start")
+            end = parse_time_text(await _prompt("  End time (HHMM): "), "end")
 
         reason = (await _prompt("  Reason (optional): ")).strip()
 
@@ -713,9 +782,10 @@ async def _discard_local_edits(state: RuntimeState) -> None:
         return
 
     answer = await _prompt(
-        "\n  Discard local edits and go back to the published schedule? [y/N]: "
+        "\n  Discard local edits and go back to the published schedule? "
+        "[1 or y = yes]: "
     )
-    if answer.strip().lower() not in ("y", "yes"):
+    if not _is_yes(answer):
         await state.echo("[menu] Cancelled.\n")
         return
 
@@ -1077,7 +1147,7 @@ async def _change_limit(state: RuntimeState, field: str, label: str) -> None:
 
     raw = await _prompt(
         f"\n  {label} is {shown}.\n"
-        f"  New value in °C ('none' to remove it, empty = cancel): "
+        f"  New value in °C ('-' or 'none' removes it, empty = cancel): "
     )
     if not raw:
         await state.echo("[menu] Cancelled.\n")
@@ -1104,9 +1174,10 @@ async def _discard_local_limits(state: RuntimeState) -> None:
         return
 
     answer = await _prompt(
-        "\n  Discard local limits and go back to the published config? [y/N]: "
+        "\n  Discard local limits and go back to the published config? "
+        "[1 or y = yes]: "
     )
-    if answer.strip().lower() not in ("y", "yes"):
+    if not _is_yes(answer):
         await state.echo("[menu] Cancelled.\n")
         return
 
@@ -1167,8 +1238,8 @@ async def _show_device_record(state: RuntimeState) -> None:
     for line in describe_record(device_record_store.record):
         await state.echo(f"  {line}")
 
-    answer = await _prompt("\n  Re-fetch from server? [y/N]: ")
-    if answer.strip().lower() not in ("y", "yes"):
+    answer = await _prompt("\n  Re-fetch from server? [1 or y = yes]: ")
+    if not _is_yes(answer):
         await state.echo("")
         return
 
@@ -1217,41 +1288,93 @@ async def _handle_choice(state: RuntimeState, choice: str) -> None:
         await state.echo(f"\n[menu] Unknown option: {choice!r}\n")
 
 
-def menu_enabled() -> bool:
+def menu_enabled(device=None) -> bool:
     """
     Whether to offer the interactive menu.
 
-    Under systemd there is no terminal: ``input()`` would raise EOFError
-    immediately, the menu would treat that as "operator chose quit", and the
-    service would exit and be restarted forever. Default to the menu only when
-    stdin is a TTY; BOILERROOM_MENU=on/off overrides.
+    A keyboard needs a terminal: under systemd there is none, ``input()`` would
+    raise EOFError immediately, the menu would treat that as "operator chose
+    quit", and the service would exit and be restarted forever.
+
+    A keypad needs nothing — it *is* the terminal, and the installed device is
+    precisely where there is no TTY and the keypad is the only way in. So the
+    device says whether it depends on one. BOILERROOM_MENU=on/off overrides.
     """
     override = os.environ.get("BOILERROOM_MENU", "").strip().lower()
     if override in ("on", "1", "true", "yes"):
         return True
     if override in ("off", "0", "false", "no"):
         return False
+
+    if device is not None and not getattr(device, "needs_tty", True):
+        return True
+
     try:
         return sys.stdin is not None and sys.stdin.isatty()
     except (AttributeError, ValueError):
         return False
 
 
+async def _start_input_device(state: RuntimeState):
+    """
+    Bring up whatever the menu reads from, falling back to the keyboard.
+
+    A keypad that will not start — miswired, pins already claimed, no
+    permission — must not take the agent down with it: the boilers are running
+    a heating programme and the server can still drive them. It costs the
+    operator the local menu, which is worth saying loudly and nothing more.
+    """
+    from mock_keypad import MockKeypad
+
+    device = getattr(state, "keypad", None) or MockKeypad()
+
+    try:
+        await device.start()
+        return device
+    except Exception as exc:
+        await state.log(
+            f"[menu] The {device.name} could not be started: {exc}",
+            level=logging.ERROR,
+        )
+
+    if isinstance(device, MockKeypad):
+        return device
+
+    await state.log(
+        "[menu] Falling back to the keyboard — nothing on this device can be "
+        "controlled by hand until the keypad is fixed",
+        level=logging.WARNING,
+    )
+    fallback = MockKeypad()
+    await fallback.start()
+    return fallback
+
+
 async def run_control_menu(state: RuntimeState) -> None:
-    if not menu_enabled():
+    device = await _start_input_device(state)
+    set_input_device(device)
+
+    if not menu_enabled(device):
         await state.log(
             "[menu] No terminal attached — control menu disabled "
             "(set BOILERROOM_MENU=on to force it)"
         )
+        await device.close()
         await state.shutdown.wait()
         return
 
-    await _run_menu_loop(state)
+    try:
+        await _run_menu_loop(state, device)
+    finally:
+        await device.close()
 
 
-async def _run_menu_loop(state: RuntimeState) -> None:
+async def _run_menu_loop(state: RuntimeState, device) -> None:
+    for line in getattr(device, "describe", list)():
+        await state.echo(line)
+
     await state.echo(
-        "Control menu ready — type a number and press Enter "
+        f"Control menu ready on the {device.name} — enter a number "
         "(sensor polling continues in background).\n"
     )
 
@@ -1265,4 +1388,13 @@ async def _run_menu_loop(state: RuntimeState) -> None:
         if state.shutdown.is_set():
             break
 
-        await _handle_choice(state, choice)
+        try:
+            await _handle_choice(state, choice)
+        except EOFError:
+            # The input device went away part-way through a submenu — stdin
+            # closed, or the keypad was shut down. Only the submenus that
+            # happen to guard their own prompts used to survive it; the rest
+            # took the whole agent down with them, which is a heating system
+            # stopping because a terminal was closed.
+            state.shutdown.set()
+            break

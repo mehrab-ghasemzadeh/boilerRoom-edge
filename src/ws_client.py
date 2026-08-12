@@ -551,6 +551,87 @@ async def _handle_apply_temperature(
     await state.notify_state_change(f"boiler {index} setpoint {float(temperature):.1f} °C (peer)")
 
 
+# Device -> server mode reporting is not in DEVICE.md yet; these names mirror
+# boiler.set_temperature / _ack / apply_temperature, which is the shape the
+# server is expected to grow. Until it does, the send is simply unanswered and
+# the mode stays queued — nothing breaks, and nothing blocks.
+MODE_MESSAGE = {"boiler": "boiler.set_mode", "pump": "pump.set_mode"}
+MODE_ACK_TYPES = ("boiler.set_mode_ack", "pump.set_mode_ack")
+MODE_APPLY_TYPES = ("boiler.apply_mode", "pump.apply_mode")
+
+MODE_INDEX_KEY = {"boiler": "boiler_index", "pump": "pump_index"}
+
+
+def _mode_target(msg_type: str, payload: dict[str, Any]):
+    """The Target a mode message refers to, or None if it names no valid unit."""
+    from schedule_runner import Target
+
+    kind = "boiler" if msg_type.startswith("boiler.") else "pump"
+    index = payload.get(MODE_INDEX_KEY[kind])
+    return Target(kind, index) if isinstance(index, bool) is False and isinstance(index, int) else None
+
+
+async def _handle_set_mode_ack(
+    message: dict[str, Any],
+    state: RuntimeState,
+) -> None:
+    """
+    Outcome of a mode this device reported upstream.
+
+    Acted on whether or not a caller is waiting: the send is fire-and-forget,
+    so this is the only thing that ever marks a mode published.
+    """
+    payload = message.get("payload") or {}
+    target = _mode_target(message.get("type", ""), payload)
+
+    if payload.get("ok") and target is not None:
+        await state.mark_mode_published(target)
+        await state.log(f"[ws] Server accepted {target} mode {payload.get('mode')}")
+    else:
+        # Put it back in the queue: a refused report has not been delivered, so
+        # it is offered again rather than left as the server's problem.
+        if target is not None:
+            await state.mark_mode_published(target, False)
+        await state.log(
+            f"[ws] Server rejected the mode report: {payload.get('error') or payload} "
+            "— kept locally and retried on the next connection",
+            level=logging.WARNING,
+        )
+
+
+async def _handle_apply_mode(
+    message: dict[str, Any],
+    state: RuntimeState,
+) -> None:
+    """A mode another device in this room set. Marked published on arrival."""
+    from mode_store import VALID_MODES
+
+    payload = message.get("payload") or {}
+    target = _mode_target(message.get("type", ""), payload)
+    mode = str(payload.get("mode") or "").strip().lower()
+
+    if target is None or mode not in VALID_MODES:
+        await state.log(
+            f"[ws] Unusable mode push: {payload}", level=logging.WARNING
+        )
+        return
+
+    if await state.get_mode(target) == mode:
+        await state.mark_mode_published(target)
+        return
+
+    await state.set_mode(target, mode, published=True)
+
+    if mode == "automatic":
+        # Hand the unit back to the schedule now rather than at its next
+        # start/end boundary, exactly as the command path does.
+        schedule_runner.forget(target)
+        await schedule_runner.evaluate(state)
+
+    await state.log(f"[ws] {target} set to {mode} by another device in this room")
+    await state.notify_state_change(f"{target} mode {mode} (peer)")
+
+
 async def _handle_server_message(
     session: _Session,
     message: dict[str, Any],
@@ -570,6 +651,10 @@ async def _handle_server_message(
         await _handle_set_temperature_ack(message, state)
     elif msg_type == "boiler.apply_temperature":
         await _handle_apply_temperature(message, state)
+    elif msg_type in MODE_ACK_TYPES:
+        await _handle_set_mode_ack(message, state)
+    elif msg_type in MODE_APPLY_TYPES:
+        await _handle_apply_mode(message, state)
     elif msg_type != "device.hello_ack":
         await state.log(f"[ws] Received {msg_type}")
 
@@ -733,6 +818,72 @@ async def publish_boiler_temperature(
         _pending_acks.pop(event_id, None)
 
 
+async def report_unit_mode(state: RuntimeState, target, mode: str) -> bool:
+    """
+    Report one unit's control mode to the server.
+
+    **Fire and forget.** The server does not implement this message yet, so
+    waiting on an ack would stall every mode change for the whole timeout and
+    give the operator nothing. The mode is already in force locally and already
+    reaches the server as ``reported_mode`` through telemetry; this is what
+    lets it also settle ``desired_mode`` once the server grows the message.
+    ``_handle_set_mode_ack`` marks it published if and when a reply arrives;
+    until then it is offered again on every reconnect.
+
+    Returns whether the message went out, not whether it was accepted.
+    """
+    session = _active_session
+    if session is None:
+        return False
+
+    msg_type = MODE_MESSAGE.get(target.type)
+    if msg_type is None:
+        return False
+
+    try:
+        await session.send_message(
+            msg_type, {MODE_INDEX_KEY[target.type]: target.index, "mode": mode}
+        )
+    except Exception as exc:
+        await state.log(f"[ws] Could not report {target} mode: {exc}", level=logging.WARNING)
+        return False
+
+    # Marked reported on the send, not on an ack. See mark_mode_published:
+    # waiting for a reply the server does not yet produce would leave the mode
+    # permanently "ours" and stop the device record ever correcting it.
+    await state.mark_mode_published(target)
+    await state.log(f"[ws] Sent {msg_type} ({target}, {mode})")
+    return True
+
+
+async def _publish_pending_modes(state: RuntimeState) -> None:
+    """
+    Offer any unacknowledged modes once connected.
+
+    A mode set during an outage is held, not dropped — the same rule the state
+    publisher applies to relay changes.
+    """
+    pending = await state.unpublished_modes()
+    if not pending:
+        return
+
+    await state.log(
+        f"[ws] Reporting {len(pending)} unacknowledged mode(s): "
+        + ", ".join(f"{t} {m}" for t, m in pending.items())
+    )
+    sent = False
+    for target, mode in pending.items():
+        if state.shutdown.is_set():
+            return
+        sent |= await report_unit_mode(state, target, mode)
+
+    if sent:
+        # The device record is what reconciles modes, and a mode only stops
+        # outranking it once reported. Poll now rather than sitting on the
+        # wrong modes until the next 15-minute tick.
+        await state.request_record_refresh()
+
+
 async def _publish_pending_setpoints(state: RuntimeState) -> None:
     """
     Offer any unacknowledged setpoints once connected.
@@ -807,13 +958,14 @@ async def _run_session(state: RuntimeState) -> None:
     _active_session = session
     heartbeat_task: asyncio.Task | None = None
     listen_task: asyncio.Task | None = None
+    reconcile_task: asyncio.Task | None = None
 
     try:
         await state.set_ws_connected(True)
         config_version, schedule_version = await state.get_active_versions()
         last_command_id = await state.get_last_processed_command_id()
 
-        await _perform_hello(
+        hello_ack = await _perform_hello(
             session,
             state,
             active_config_version=config_version,
@@ -824,17 +976,27 @@ async def _run_session(state: RuntimeState) -> None:
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(session, state), name="ws_heartbeat"
         )
-        # Started before the publish so the ack, which arrives on the listen
-        # loop, can actually be received.
+        # Started before reconciliation: the acks it waits on, and the
+        # config/schedule the server pushes in answer to hello, all arrive on
+        # the listen loop.
         listen_task = asyncio.create_task(
             _listen_loop(session, state), name="ws_listen"
         )
-        await _publish_pending_schedule(state)
-        await _publish_pending_setpoints(state)
+
+        # Deferred so this module does not depend on the reconciler at import
+        # time — it reaches back here for the publish helpers.
+        from reconcile import reconcile_after_hello
+
+        # Run alongside the listen loop rather than before it. Reconciliation
+        # waits for pushes that the listen loop is what delivers, so awaiting
+        # it here would deadlock until the grace period expired.
+        reconcile_task = asyncio.create_task(
+            reconcile_after_hello(state, hello_ack), name="ws_reconcile"
+        )
         await listen_task
     finally:
         _active_session = None
-        for task in (heartbeat_task, listen_task):
+        for task in (heartbeat_task, listen_task, reconcile_task):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

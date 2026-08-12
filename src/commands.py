@@ -130,13 +130,22 @@ async def _set_mode(
     if relay_for_target(schedule_target) is None:
         return _failed(f"no relay mapped for {kind} {index}")
 
-    await state.set_mode(schedule_target, mode)
+    # Published on the spot: this mode arrived *from* the server, so reporting
+    # it back would be a pointless round trip.
+    await state.set_mode(schedule_target, mode, published=True)
 
     if mode == "automatic":
         # Let the schedule re-assert this target on the next evaluation instead
         # of waiting for its next transition.
         schedule_runner.forget(schedule_target)
         await schedule_runner.evaluate(state)
+
+    # Mode reaches the server only through telemetry's boiler_states /
+    # pump_states, and DEVICE.md has *boiler* command results updating
+    # reported_mode but not pump ones. Without this a commanded mode change sat
+    # unconfirmed until the next scheduled post — a whole read interval — while
+    # every other actuator here reports at once.
+    await state.notify_state_change(f"{kind} {index} mode {mode} (command)")
 
     return CommandOutcome(
         STATUS_EXECUTED,

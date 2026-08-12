@@ -19,6 +19,10 @@ class RelayController:
 
     def _setup_gpio(self):
         GPIO.setmode(GPIO.BCM)
+        # The keypad claims its own pins from another thread; without this,
+        # whichever of the two runs second warns about every channel the first
+        # has already set up.
+        GPIO.setwarnings(False)
         for relay in RELAYS.values():
             gpio = relay["gpio"]
             GPIO.setup(gpio, GPIO.OUT)
@@ -51,4 +55,8 @@ class RelayController:
     def _cleanup_sync(self):
         for relay_id in RELAYS:
             self._set_relay(relay_id, False)
-        GPIO.cleanup()
+        # Only the relay pins. A bare GPIO.cleanup() releases every channel on
+        # the chip, which since the keypad arrived would also drop the pins it
+        # is scanning — and the sensor loop's shutdown runs while the menu is
+        # still up.
+        GPIO.cleanup([relay["gpio"] for relay in RELAYS.values()])

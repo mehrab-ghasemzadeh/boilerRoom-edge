@@ -42,6 +42,10 @@ class RuntimeState:
         self.relay_controller = None
         self.gas_reader = None
         self.temperature_reader = None
+        # What the control menu is answered on: the GPIO matrix keypad on the
+        # installed device, the keyboard on the bench. Set by main from the
+        # same USE_MOCK_HARDWARE switch as the readers above.
+        self.keypad = None
 
         self._ws_lock = asyncio.Lock()
         self.ws_connected = False
@@ -53,6 +57,19 @@ class RuntimeState:
 
         # Set by device.restart_service so the session drops and reconnects.
         self.ws_reconnect_requested = asyncio.Event()
+
+        # Asks the device-record loop to poll now instead of at its next tick.
+        # Used after reporting modes upstream: the record is what reconciles
+        # them, and waiting out the 15-minute interval to find out leaves the
+        # device on the wrong modes for the whole of it.
+        self.record_refresh_requested = asyncio.Event()
+
+        # Held while a record is being adopted. The record loop and the
+        # post-hello reconciler both fetch and apply one, and adoption is not
+        # atomic — it sets modes, setpoints, calibration and the mapping in
+        # turn — so without this a reconnect landing on a poll could apply
+        # halves of two different records.
+        self.record_lock = asyncio.Lock()
 
         self._control_lock = asyncio.Lock()
         self._modes: dict[Any, str] = {}
@@ -135,13 +152,27 @@ class RuntimeState:
     async def request_ws_reconnect(self) -> None:
         self.ws_reconnect_requested.set()
 
+    async def request_record_refresh(self) -> None:
+        """Ask the device-record loop to poll now rather than at its next tick."""
+        self.record_refresh_requested.set()
+
     # -- control mode (automatic = schedule driven, manual = command driven) --
 
-    async def set_mode(self, target: Any, mode: str) -> None:
+    async def set_mode(self, target: Any, mode: str, *, published: bool = False) -> None:
+        """
+        Set a unit's control mode.
+
+        ``published`` says the server already knows: true for a mode that
+        arrived *as* a command or a peer push, false for one set here, which is
+        then reported upstream and retried until acknowledged.
+        """
+        from mode_store import ModeEntry
+
+        entry = ModeEntry(mode, published)
         async with self._control_lock:
-            if self._modes.get(target) == mode:
+            if self._modes.get(target) == entry:
                 return  # no change, no write
-            self._modes[target] = mode
+            self._modes[target] = entry
             snapshot = dict(self._modes)
 
         # Persisted here rather than at the call sites so a future caller
@@ -150,7 +181,41 @@ class RuntimeState:
         # needs to wait for it.
         await self._persist_modes(snapshot)
 
-    async def restore_modes(self, modes: dict[Any, str]) -> None:
+    async def mark_mode_published(self, target: Any, published: bool = True) -> None:
+        """
+        Record whether this unit's mode has been reported to the server.
+
+        Set when the report is *sent*, not when it is acknowledged. The server
+        does not implement the mode message yet, so waiting for an ack would
+        leave every mode permanently unreported — and an unreported mode
+        outranks the server's ``desired_mode``, which would block the record
+        from ever correcting the device. Sending is the device's whole
+        obligation; if the server still disagrees at the next poll, it wins.
+
+        Cleared again when the server explicitly rejects the report, so it is
+        offered afresh on the next connection.
+        """
+        from mode_store import ModeEntry
+
+        async with self._control_lock:
+            entry = self._modes.get(target)
+            if entry is None or entry.published == published:
+                return
+            self._modes[target] = ModeEntry(entry.mode, published)
+            snapshot = dict(self._modes)
+
+        await self._persist_modes(snapshot)
+
+    async def unpublished_modes(self) -> dict[Any, str]:
+        """Modes not yet reported to the server, in a stable order."""
+        async with self._control_lock:
+            return {
+                target: entry.mode
+                for target, entry in sorted(self._modes.items(), key=str)
+                if not entry.published
+            }
+
+    async def restore_modes(self, modes: dict[Any, Any]) -> None:
         """Load modes from the cache at boot, without writing them straight back."""
         async with self._control_lock:
             self._modes.update(modes)
@@ -169,11 +234,19 @@ class RuntimeState:
 
     async def get_mode(self, target: Any) -> str:
         async with self._control_lock:
-            return self._modes.get(target, "automatic")
+            entry = self._modes.get(target)
+        return entry.mode if entry is not None else "automatic"
 
     async def get_modes(self) -> dict[Any, str]:
+        """
+        Target -> mode name.
+
+        Projected from the stored entries, which also carry whether the server
+        has acknowledged each one; callers that only drive relays or build
+        telemetry want the mode alone.
+        """
         async with self._control_lock:
-            return dict(self._modes)
+            return {target: entry.mode for target, entry in self._modes.items()}
 
     # -- per-boiler temperature setpoints ------------------------------------
     #

@@ -277,6 +277,51 @@ class TelemetryQueued(RuntimeError):
     """The envelope was stored for retry instead of being delivered."""
 
 
+# How long a reconnect may spend clearing the backlog before handing back to
+# the regular cadence. A day offline is ~1440 envelopes; sending them all at
+# once would be 1440 back-to-back TLS handshakes on one ARMv6 core, with the
+# limit guard and the schedule waiting behind them. A minute of catching up is
+# worth it, an hour of the device being useless is not.
+RECONNECT_DRAIN_SECONDS = 60.0
+
+
+async def drain_outbox(state, budget_seconds: float = RECONNECT_DRAIN_SECONDS):
+    """
+    Clear as much of the backlog as a time budget allows, oldest first.
+
+    Returns ``(delivered, remaining)``. Called on reconnect: the per-cycle
+    flush inside ``post_telemetry`` sends one batch a minute, which is right
+    for steady state but leaves a device that has been off the air for hours
+    slowly dribbling out readings the server needs to draw a graph.
+
+    Holds the send lock for the whole drain, so a live post cannot overtake the
+    queue and rewind the server's view of the relays.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_seconds
+    delivered = 0
+
+    async with _send_lock:
+        while not state.shutdown.is_set():
+            sent, drained = await flush_outbox(state)
+            delivered += sent
+
+            if drained:
+                return delivered, 0
+            if sent == 0:
+                # Nothing moved: the server is refusing or unreachable. Retrying
+                # in a tight loop would only burn handshakes.
+                break
+            if loop.time() >= deadline:
+                break
+
+            # Let the sensor loop and the limit guard have the core back
+            # between batches.
+            await asyncio.sleep(0)
+
+    return delivered, (await reading_store.outbox_stats())["pending"]
+
+
 async def flush_outbox(state, limit: int = FLUSH_BATCH) -> tuple[int, bool]:
     """
     Re-send undelivered telemetry, oldest first.

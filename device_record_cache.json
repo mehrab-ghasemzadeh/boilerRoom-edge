@@ -5,22 +5,23 @@
   "serial_number": "1234567890h",
   "boiler_room": 1,
   "status": "active",
-  "presence": "offline",
+  "presence": "online",
   "device_status": "normal",
   "firmware_version": "1.0.0",
   "hardware_version": "edge-dev",
-  "last_seen_at": "2026-08-11T14:19:17.244364Z",
-  "last_heartbeat_at": "2026-08-11T14:18:57.263304Z",
-  "uptime_seconds": 92,
+  "last_seen_at": "2026-08-11T23:53:40.093027Z",
+  "last_heartbeat_at": "2026-08-11T23:53:40.093012Z",
+  "uptime_seconds": 874,
   "network_type": "wifi",
   "rssi_dbm": -55,
   "active_config_version": 14,
-  "active_schedule_version": 28,
+  "active_schedule_version": 32,
   "capabilities": {
     "supported_commands": [
       "boiler.turn_on",
       "boiler.turn_off",
       "boiler.set_mode",
+      "boiler.set_temperature",
       "pump.turn_on",
       "pump.turn_off",
       "pump.set_mode",
@@ -42,9 +43,9 @@
       "desired_state": "off",
       "reported_state": "off",
       "desired_mode": "automatic",
-      "reported_mode": "manual",
+      "reported_mode": "automatic",
       "desired_temperature_c": "80.0",
-      "reported_temperature_c": "48.4"
+      "reported_temperature_c": "68.6"
     },
     {
       "id": 2,
@@ -57,7 +58,7 @@
       "desired_mode": "automatic",
       "reported_mode": "automatic",
       "desired_temperature_c": "80.0",
-      "reported_temperature_c": "76.5"
+      "reported_temperature_c": "61.3"
     },
     {
       "id": 5,
@@ -70,7 +71,7 @@
       "desired_mode": "automatic",
       "reported_mode": "automatic",
       "desired_temperature_c": "80.0",
-      "reported_temperature_c": "61.4"
+      "reported_temperature_c": "51.9"
     }
   ],
   "pump_units": [
@@ -91,8 +92,8 @@
       "name": "Pump 2",
       "enabled": true,
       "controller_device_id": 1,
-      "desired_state": "on",
-      "reported_state": "on",
+      "desired_state": "off",
+      "reported_state": "off",
       "desired_mode": "automatic",
       "reported_mode": "automatic"
     }
@@ -110,9 +111,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 36.82,
+      "latest_value": 48.01,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 2,
@@ -126,9 +127,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 61.36,
+      "latest_value": 51.87,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 3,
@@ -142,9 +143,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 18.35,
+      "latest_value": 25.18,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 9,
@@ -158,9 +159,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 48.39,
+      "latest_value": 68.6,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 10,
@@ -174,9 +175,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 76.54,
+      "latest_value": 61.29,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 11,
@@ -190,9 +191,9 @@
       "unit": "C",
       "enabled": true,
       "calibration": {},
-      "latest_value": 30.96,
+      "latest_value": 23.38,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 7,
@@ -206,9 +207,9 @@
       "unit": "",
       "enabled": true,
       "calibration": {},
-      "latest_value": 12226.0,
+      "latest_value": 8987.0,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     },
     {
       "id": 8,
@@ -222,9 +223,9 @@
       "unit": "",
       "enabled": true,
       "calibration": {},
-      "latest_value": 13678.0,
+      "latest_value": 10552.0,
       "latest_status": "ok",
-      "latest_captured_at": "2026-08-11T14:18:41Z"
+      "latest_captured_at": "2026-08-11T23:53:19Z"
     }
   ],
   "relays": [
@@ -285,5 +286,5 @@
     }
   ],
   "created_at": "2026-08-01T15:20:14Z",
-  "updated_at": "2026-08-11T14:18:57.263642Z"
+  "updated_at": "2026-08-11T23:53:40.093340Z"
 }

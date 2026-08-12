@@ -7,32 +7,26 @@ import logging
 import signal
 
 from auth import AuthError, MissingCredentialsError, token_manager
-from config import load_device_mapping
 from control_menu import run_control_menu
 from data_logger import reading_store, save_readings
 from device_config import ConfigError, config_store, load_cached_config
 from device_record import (
     DeviceRecordError,
     apply_calibration,
-    capability_mismatches,
     device_record_store,
-    divergences,
     fetch_device_record,
     load_cached_device_record,
-    save_cached_device_record,
 )
 from errors_client import error_reporter
 from limits_guard import limit_guard
 from logging_setup import configure_logging, shutdown_logging
-from mapping_provider import MappingUnavailableError, RecordMappingProvider
 from mode_store import load_modes
-from mapping_store import mapping_store
-from record_mapping import mapping_differences
+from record_sync import adopt_device_record, load_mapping
 from runtime_state import RuntimeState
 from schedule_runner import ScheduleError, load_cached_schedule, schedule_runner
 from state_publisher import run_state_publisher
 from telemetry_client import post_telemetry
-from ws_client import CAPABILITIES, run_websocket_client
+from ws_client import run_websocket_client
 
 # ----------------------------------------------------
 # Configuration
@@ -68,10 +62,17 @@ if USE_MOCK_HARDWARE:
     from mock_temperature_reader import MockTemperatureReader as TemperatureReader
     from mock_gas_reader import MockGasReader as GasReader
     from mock_relay_controller import MockRelayController as RelayController
+    # On the bench the control menu is answered from the keyboard, as it always
+    # has been. BOILERROOM_KEYPAD_EMULATE=on restricts it to the keys the real
+    # keypad has, to find prompts the device could not answer.
+    from mock_keypad import MockKeypad as Keypad
 else:
     from temperature_reader import TemperatureReader
     from gas_reader import GasReader
     from relay_controller import RelayController
+    # The installed device has no keyboard: the menu is answered on the matrix
+    # keypad wired to the header.
+    from keypad import Keypad
 
 
 async def print_startup_banner(state: RuntimeState) -> None:
@@ -109,36 +110,6 @@ async def print_startup_banner(state: RuntimeState) -> None:
             f"(role={cfg['role']}, unit={unit}, GPIO {cfg['gpio']})"
         )
     await state.echo("")
-
-
-async def load_mapping(state: RuntimeState) -> bool:
-    """
-    Build the device mapping, tolerating not having one yet.
-
-    The wiring lives in the server record, so an unpaired device genuinely does
-    not know what it is connected to. Failing to start would give a restart
-    loop under systemd and no way to recover; instead the agent comes up, and
-    the record loop sets the mapping once the server supplies it.
-    """
-    try:
-        await load_device_mapping()
-    except MappingUnavailableError as exc:
-        await state.log(
-            f"[mapping] No usable device mapping — {exc}",
-            level=logging.WARNING,
-        )
-        await state.log(
-            "[mapping] Waiting for the server record; sensors and relays stay idle "
-            "until the installation is described",
-            level=logging.WARNING,
-        )
-        return False
-    except Exception as exc:
-        await state.log(f"[mapping] Failed to load: {exc}", level=logging.ERROR)
-        return False
-
-    state.mapping_ready.set()
-    return True
 
 
 async def sensor_loop(state: RuntimeState) -> None:
@@ -391,131 +362,6 @@ async def restore_cached_device_record(state: RuntimeState) -> None:
     )
 
 
-async def adopt_device_record(state: RuntimeState, record, payload) -> None:
-    """Make a freshly fetched record active, cache it, and report what it says."""
-    previous = device_record_store.record
-    device_record_store.set_record(record)
-    await save_cached_device_record(payload)
-
-    if previous is None or previous.fetched_at == "":
-        await state.log(
-            f"[device] Record for {record.public_id}: "
-            f"{len(record.sensors)} server sensor(s), "
-            f"{len(device_record_store.offsets)} calibration offset(s), "
-            f"{len(device_record_store.disabled)} disabled, "
-            f"{len(record.boiler_units)} boiler(s), {len(record.pump_units)} pump(s)"
-        )
-
-    for uid, offset in sorted(device_record_store.offsets.items()):
-        await state.log(f"[device] Calibration {uid}: {offset:+.2f} °C")
-    for uid in sorted(device_record_store.disabled):
-        await state.log(
-            f"[device] Sensor {uid} is disabled server-side — "
-            "excluded from telemetry, still used for safety limits",
-            level=logging.WARNING,
-        )
-
-    # Intent divergence is reported, never applied: the server re-dispatches
-    # queued commands after every hello, and acting here could flip a boiler to
-    # manual — off the schedule — without a command ever being issued.
-    for line in divergences(record):
-        await state.log(f"[device] Divergence — {line}", level=logging.WARNING)
-
-    for line in capability_mismatches(record, CAPABILITIES):
-        await state.log(f"[device] Capability mismatch — {line}", level=logging.WARNING)
-
-    await adopt_record_setpoints(state, record)
-
-    # A device that booted without a mapping can start working the moment the
-    # server describes it; only then is drift meaningful.
-    if not await adopt_mapping_if_missing(state):
-        await report_mapping_drift(state, record)
-
-
-async def adopt_record_setpoints(state: RuntimeState, record) -> None:
-    """
-    Take each boiler's setpoint from the server record.
-
-    Unlike ``desired_state`` and ``desired_mode``, which are reported and never
-    applied because acting on them would race the command flow,
-    ``desired_temperature_c`` *is* the setpoint: DEVICE.md has the server push
-    it to devices as ``boiler.apply_temperature``, so the record is simply the
-    same instruction arriving by poll instead of by socket. Applying it is what
-    lets a device pick up a temperature set from an app while it was offline.
-
-    Only a change is written, so this costs the card nothing on a steady state.
-    """
-    from setpoint_store import SetpointError
-
-    for unit in record.boiler_units:
-        wanted = unit.desired_temperature_c
-        if wanted is None:
-            continue
-        if await state.get_setpoint(unit.index) == wanted:
-            continue
-        try:
-            await state.set_setpoint(unit.index, wanted, published=True)
-        except SetpointError as exc:
-            await state.log(
-                f"[device] Ignoring boiler {unit.index} setpoint from the record: {exc}",
-                level=logging.WARNING,
-            )
-            continue
-        await state.log(
-            f"[device] Boiler {unit.index} setpoint {wanted:.1f} °C from the server record"
-        )
-
-
-async def adopt_mapping_if_missing(state: RuntimeState) -> bool:
-    """
-    Build the mapping from a record that has just arrived.
-
-    Only ever fills a gap: once a mapping is driving the hardware it is left
-    alone, because the relay controller configured its pins from it at startup.
-    """
-    if state.mapping_ready.is_set():
-        return False
-
-    if not await load_mapping(state):
-        return False
-
-    await state.log("[mapping] Device mapping adopted from the server record")
-    return True
-
-
-async def report_mapping_drift(state: RuntimeState, record) -> None:
-    """
-    Say so when the record's wiring no longer matches what is running.
-
-    The mapping is deliberately *not* swapped underneath a running agent: the
-    relay controller configures its GPIO pins once at startup, so adopting a
-    new pin map without re-initialising the hardware would drive pins that were
-    never set up. A restart applies it.
-    """
-    from record_mapping import RecordMappingError, mapping_from_record, readiness_problems
-
-    if not isinstance(mapping_store.provider, RecordMappingProvider):
-        return
-
-    problems = readiness_problems(record)
-    if problems:
-        for problem in problems:
-            await state.log(
-                f"[mapping] Server record not usable as a mapping — {problem}",
-                level=logging.WARNING,
-            )
-        return
-
-    try:
-        document = mapping_from_record(record)
-    except RecordMappingError as exc:
-        await state.log(f"[mapping] Server record cannot be mapped: {exc}", level=logging.WARNING)
-        return
-
-    for line in mapping_differences(document):
-        await state.log(f"[mapping] Drift — {line}", level=logging.WARNING)
-
-
 async def device_record_loop(state: RuntimeState) -> None:
     """
     Keep the device record fresh.
@@ -528,26 +374,40 @@ async def device_record_loop(state: RuntimeState) -> None:
         return
 
     while not state.shutdown.is_set():
-        try:
-            record, payload = await fetch_device_record()
-        except DeviceRecordError as exc:
-            await state.log(
-                f"[device] Server record unusable: {exc}", level=logging.WARNING
-            )
-        except Exception as exc:
-            await state.log(
-                f"[device] Failed to fetch record: {exc}", level=logging.WARNING
-            )
-        else:
-            await adopt_device_record(state, record, payload)
+        # Shared with the post-hello reconciler, which fetches a record too.
+        # Adoption is not atomic, so without this the two could apply halves of
+        # two different records.
+        async with state.record_lock:
+            try:
+                record, payload = await fetch_device_record()
+            except DeviceRecordError as exc:
+                await state.log(
+                    f"[device] Server record unusable: {exc}", level=logging.WARNING
+                )
+            except Exception as exc:
+                await state.log(
+                    f"[device] Failed to fetch record: {exc}", level=logging.WARNING
+                )
+            else:
+                await adopt_device_record(state, record, payload)
 
+        # Wakes early when something asks for a refresh — reporting modes
+        # upstream does, because this poll is what reconciles them.
+        state.record_refresh_requested.clear()
+        waiters = [
+            asyncio.create_task(state.shutdown.wait()),
+            asyncio.create_task(state.record_refresh_requested.wait()),
+        ]
         try:
-            await asyncio.wait_for(
-                state.shutdown.wait(),
+            await asyncio.wait(
+                waiters,
                 timeout=DEVICE_RECORD_REFRESH_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        except asyncio.TimeoutError:
-            pass
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
 
 
 async def restore_cached_modes(state: RuntimeState) -> None:
@@ -579,13 +439,20 @@ async def restore_cached_modes(state: RuntimeState) -> None:
 
     await state.restore_modes(modes)
 
-    manual = sorted((str(t) for t, m in modes.items() if m == "manual"))
+    manual = sorted(str(t) for t, e in modes.items() if e.mode == "manual")
     if manual:
         await state.log(
             f"[mode] Restored {len(modes)} mode(s); still on manual: {', '.join(manual)}"
         )
     else:
         await state.log(f"[mode] Restored {len(modes)} mode(s), all automatic")
+
+    unreported = sorted(str(t) for t, e in modes.items() if not e.published)
+    if unreported:
+        await state.log(
+            f"[mode] Not yet reported to the server: {', '.join(unreported)} — "
+            "will be sent on the next connection"
+        )
 
 
 async def restore_cached_config(state: RuntimeState) -> None:
@@ -694,6 +561,19 @@ async def main() -> None:
     configure_logging()
     state = RuntimeState(read_interval=DEFAULT_READ_INTERVAL)
     install_signal_handlers(state)
+
+    # Constructed here, started by the control menu — it is the only thing that
+    # reads from it, and it has to be able to fall back to the keyboard when a
+    # keypad will not come up. A misconfigured pin map is caught in the
+    # constructor and must not stop an agent whose real job is the heating.
+    try:
+        state.keypad = Keypad()
+    except Exception as exc:
+        await state.log(
+            f"[menu] Keypad not configured: {exc} — the menu falls back to "
+            "the keyboard, if there is one",
+            level=logging.ERROR,
+        )
 
     # The record comes first: it is the mapping source, so it has to be in
     # place before the mapping is built from it.
