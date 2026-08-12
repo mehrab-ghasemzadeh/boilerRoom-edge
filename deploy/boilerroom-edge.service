@@ -7,14 +7,23 @@ Documentation=https://git.mayanext.com/mehrab_ghw/boilerRoom-edge
 After=network-online.target
 Wants=network-online.target
 
-# If it crashes 5 times in 5 minutes, stop trying — something is wrong that
-# restarting will not fix, and a tight loop on an SD card is its own problem.
+# Keep restarting, but not in a tight loop: five failures in five minutes means
+# something restarting will not fix, and hammering an SD card is its own
+# problem. The window is long enough that a device failing every few minutes
+# keeps being retried rather than being abandoned — this runs heating, and a
+# service that has quietly given up is worse than one that is still trying.
 # These live in [Unit], not [Service]: systemd moved them in v229.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=simple
+
+# The agent's own log is written straight to a file; this is only for the
+# startup banner and anything that escapes before logging is configured.
+# Unbuffered, or the journal shows nothing until the process ends — which for
+# a service meant to run for months means nothing, ever.
+Environment=PYTHONUNBUFFERED=1
 
 # Adjust if the checkout or service account differs.
 User=pi

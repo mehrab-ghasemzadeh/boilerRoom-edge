@@ -4,7 +4,9 @@ load_dotenv()
 
 import asyncio
 import logging
+import os
 import signal
+from pathlib import Path
 
 from auth import (
     AuthError,
@@ -40,7 +42,39 @@ from ws_client import run_websocket_client
 # Configuration
 # ----------------------------------------------------
 
-USE_MOCK_HARDWARE = True
+def _is_raspberry_pi() -> bool:
+    """Whether there is a GPIO header under this process."""
+    try:
+        model = Path("/proc/device-tree/model").read_bytes()
+    except OSError:
+        return False
+    return b"raspberry pi" in model.lower()
+
+
+def _use_mock_hardware() -> bool:
+    """
+    Simulated sensors and relays, or the real ones.
+
+    Decided by what this is running on rather than by a constant somebody has
+    to remember to flip. The agent starts at boot from systemd, and a device
+    that came up simulating its own boiler room — reporting invented
+    temperatures to the server, driving nothing — is a failure that looks
+    exactly like success from every screen you might check.
+
+    BOILERROOM_MOCK_HARDWARE=on forces the mocks, which is how you run the real
+    menu against fake sensors on a Pi; =off forces the hardware, and then a
+    missing RPi.GPIO or spidev is an ImportError at startup rather than a
+    silent downgrade.
+    """
+    override = os.environ.get("BOILERROOM_MOCK_HARDWARE", "").strip().lower()
+    if override in ("on", "1", "true", "yes"):
+        return True
+    if override in ("off", "0", "false", "no"):
+        return False
+    return not _is_raspberry_pi()
+
+
+USE_MOCK_HARDWARE = _use_mock_hardware()
 
 # Sensors are read once a minute, matching the telemetry cadence: at the old
 # 10 s there were five discarded cycles for every one that was uploaded, all of
@@ -624,6 +658,19 @@ async def main() -> None:
     configure_logging()
     state = RuntimeState(read_interval=DEFAULT_READ_INTERVAL)
     install_signal_handlers(state)
+
+    # Said out loud on every boot, because it is the one setting whose being
+    # wrong is invisible: a device reporting simulated readings looks healthy
+    # from the server, the dashboard and the panel alike.
+    await state.log(
+        "[main] Hardware: "
+        + (
+            "SIMULATED — sensors and relays are not real"
+            if USE_MOCK_HARDWARE
+            else "real sensors, relays, keypad and display"
+        ),
+        level=logging.WARNING if USE_MOCK_HARDWARE else logging.INFO,
+    )
 
     # Constructed here, started by the control menu — it is the only thing that
     # reads from it, and it has to be able to fall back to the keyboard when a

@@ -1,0 +1,55 @@
+#!/sbin/openrc-run
+#
+# OpenRC service for the Smart Boiler Room edge agent — Alpine Linux.
+#
+# Installed to /etc/init.d/boilerroom-edge by deploy/install-alpine.sh, which
+# also writes /etc/conf.d/boilerroom-edge with the paths for this checkout.
+# Nothing in here is rewritten at install time; edit the conf.d file instead.
+
+supervisor=supervise-daemon
+
+name="boilerroom-edge"
+description="Smart Boiler Room edge agent"
+
+# Defaults, overridden by /etc/conf.d/boilerroom-edge.
+: "${BOILERROOM_DIR:=/opt/boilerRoom-edge}"
+: "${BOILERROOM_PYTHON:=/usr/bin/python3}"
+: "${BOILERROOM_USER:=root}"
+
+command="${BOILERROOM_PYTHON}"
+command_args="${BOILERROOM_DIR}/src/main.py"
+command_user="${BOILERROOM_USER}"
+directory="${BOILERROOM_DIR}"
+
+# Only the startup banner and anything escaping before logging is configured
+# reach these; the agent writes its own rotating log to data/boilerroom.log.
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+# Restart it if it dies, for as long as it keeps dying. A heating controller
+# that has quietly given up is worse than one still trying, and the ten second
+# gap keeps a failing start off the SD card's back.
+respawn_delay=10
+respawn_period=300
+respawn_max=0
+
+# The journal equivalent shows nothing until the process ends otherwise, which
+# for a service meant to run for months means never.
+export PYTHONUNBUFFERED=1
+
+depend() {
+    # The checkout holds the caches, the database and the credentials, so it
+    # has to be mounted before this starts.
+    need localmount
+    # Wanted, not needed: the whole design is that a boiler room which reboots
+    # during an outage still runs its heating programme from the cached
+    # schedule. Waiting for a network that may never come back would defeat it.
+    want net
+    after firewall
+}
+
+stop_pre() {
+    # SIGTERM is handled: relays are released and SQLite closed before exit.
+    # supervise-daemon sends it and waits, which is all this needs.
+    return 0
+}

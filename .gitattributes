@@ -1,0 +1,13 @@
+# These files are executed by the device, not read on the machine they are
+# edited on. A CRLF that Windows introduced turns "#!/bin/sh" into an
+# interpreter name ending in a carriage return, and the device answers with
+# "bad interpreter: no such file or directory" — which says nothing at all
+# about what is actually wrong.
+*.sh        text eol=lf
+*.openrc    text eol=lf
+*.service   text eol=lf
+
+# Read by the agent's own .env parser, which keeps trailing carriage returns
+# in the values. A credential with a stray \r fails to log in and looks right
+# in every editor you might check it with.
+.env.example text eol=lf

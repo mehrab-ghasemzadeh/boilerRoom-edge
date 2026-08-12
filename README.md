@@ -989,9 +989,21 @@ cp .env.example .env      # then fill in the credentials
 python src/main.py
 ```
 
-`USE_MOCK_HARDWARE` at the top of [`src/main.py`](src/main.py) selects simulated
-sensors, relays, keypad and display. Set it to `False` on the Pi, where there
-are two more packages to install:
+Simulated sensors, relays, keypad and display are selected automatically off
+the Pi, and the real ones on it — `/proc/device-tree/model` decides, and every
+boot logs which it got. That is deliberately not a constant somebody has to
+remember to flip: the agent starts unattended at boot, and a device that came
+up simulating its own boiler room reports invented temperatures to the server
+and drives nothing, which looks exactly like success from every screen you
+might check.
+
+`BOILERROOM_MOCK_HARDWARE=on` forces the mocks — which is how to exercise the
+real menu against fake sensors on a Pi — and `=off` forces the hardware, where
+a missing `RPi.GPIO` or `spidev` is then an error at startup rather than a
+silent downgrade.
+
+On the Pi there are two more packages, which
+[`sudo ./deploy/install.sh`](#running-as-a-service) installs for you:
 
 ```bash
 pip install -r requirements_hardware.txt     # RPi.GPIO and spidev
@@ -1002,8 +1014,7 @@ agent be developed and tested on a machine with no GPIO header. On Raspberry Pi
 OS Bookworm and later, pip will not install into the system Python that the
 service runs — use `sudo apt install python3-rpi.gpio python3-spidev`, or point
 the service at a virtualenv. See
-[`requirements_hardware.txt`](requirements_hardware.txt), which also lists what
-has to be enabled on the host: SPI, 1-Wire, and the `gpio`/`spi` groups.
+[`requirements_hardware.txt`](requirements_hardware.txt).
 
 Mock temperatures are generated per role — indoor 18–28 °C, outdoor 5–35 °C,
 inlet 30–60 °C, outlet 40–85 °C, body 40–90 °C — so limit enforcement behaves
@@ -1012,17 +1023,130 @@ not come back in mock mode, because the mock never produces outlet water below
 the 30 °C minimum. It generates independent random readings rather than
 simulating a boiler cooling down.
 
+### Getting the code onto the device
+
+Either clone it, which is the one that lets you pull a fix later:
+
+```bash
+apk add git                                    # Alpine; or: sudo apt install git
+git clone https://git.mayanext.com/mehrab_ghw/boilerRoom-edge.git
+cd boilerRoom-edge
+```
+
+or push a working copy from the machine you edit on:
+
+```bash
+rsync -av --exclude .git --exclude data --exclude .env \
+      ./ root@boiler-pi:/opt/boilerRoom-edge/
+```
+
+`.env` is excluded on purpose — the device asks for its credentials at the
+panel and writes its own. Copy it only if you want the device pre-signed-in.
+
+The installers need to be executable. `git clone` handles that; `scp` from
+Windows often does not, and neither does a zip:
+
+```bash
+chmod +x deploy/install-alpine.sh deploy/install.sh
+```
+
+Or skip the bit entirely and run the interpreter directly — `sh
+deploy/install-alpine.sh` works whatever the mode says.
+
 ### Running as a service
+
+Starting with the Pi is the whole point of the thing — a boiler room that lost
+power at 3 a.m. has to come back on its own.
+
+**On Alpine Linux** (OpenRC — no systemd, no apt, no `raspi-config`):
+
+```bash
+doas ./deploy/install-alpine.sh          # or sudo, or as root
+```
+
+For a first installation, follow
+[docs/alpine-deployment.md](docs/alpine-deployment.md) instead — start to
+finish, from the SD card to pulling the power to prove it comes back.
+
+**On Raspberry Pi OS** (systemd):
 
 ```bash
 sudo ./deploy/install.sh
 ```
 
-The installer rewrites [`deploy/boilerroom-edge.service`](deploy/boilerroom-edge.service)
-for this checkout — its path, the account owning it, and the `python3` on
-`PATH` — then enables and starts it. It only adds the `gpio`/`spi`/`i2c`
-supplementary groups that actually exist on the host, since systemd refuses to
-start a unit naming a missing group.
+It is safe to re-run, and it does four things, which are the four that stand
+between a checkout and a device that survives a power cut:
+
+1. **Rewrites the unit** ([`deploy/boilerroom-edge.service`](deploy/boilerroom-edge.service))
+   for this checkout — its path, the account owning it, and the `python3` on
+   `PATH`. It only adds the `gpio`/`spi`/`i2c` supplementary groups that
+   actually exist on the host, since systemd refuses to start a unit naming a
+   missing group.
+2. **Installs the Python packages**, with apt rather than pip, because the
+   service runs the system Python and Bookworm will not let pip near it. If any
+   are still missing afterwards it stops rather than enabling a service that
+   would fail on every restart until systemd gave up.
+3. **Enables SPI and 1-Wire**, without which there is no `/dev/spidev0.1` for
+   the display, no `/dev/spidev0.0` for the gas ADC and no `/sys/bus/w1` for
+   the probes. It says so if a reboot is needed for the device nodes to appear.
+4. **Enables and starts the service**, so it comes up at boot and restarts if
+   it stops.
+
+Then, on the panel, sign the device in — see
+[Signing in at the panel](#signing-in-at-the-panel). No `.env` is needed
+beforehand; the installer says so when there are no credentials in one.
+
+| | Alpine / OpenRC | Raspberry Pi OS / systemd |
+|---|---|---|
+| Is it running | `rc-service boilerroom-edge status` | `systemctl status boilerroom-edge` |
+| Init's view | `tail -f /var/log/boilerroom-edge.log` | `journalctl -u boilerroom-edge -f` |
+| Restart it | `rc-service boilerroom-edge restart` | `systemctl restart boilerroom-edge` |
+| Off at boot | `rc-update del boilerroom-edge default` | `systemctl disable --now boilerroom-edge` |
+
+What the agent itself says is in `data/boilerroom.log` either way, and that is
+the one worth watching.
+
+Both restart the agent if it dies, with a ten second gap so a failing start
+does not hammer the SD card. Both send `SIGTERM` to stop it, which it handles —
+relays released and the database closed, rather than killed mid-write. They
+differ in one respect: OpenRC's `supervise-daemon` keeps restarting
+indefinitely, while the systemd unit gives up after five failures in five
+minutes.
+
+#### Alpine specifics
+
+Three things differ from Raspberry Pi OS, and the installer handles all three —
+they are listed here because they are what to check when something is wrong:
+
+* **The Python packages are built, not downloaded.** Alpine packages neither
+  `RPi.GPIO` nor `spidev`, and there are no musl wheels for either, so the
+  installer adds `build-base`, `python3-dev` and `linux-headers` and compiles
+  them into a virtualenv at `.venv-pi`. The service runs that interpreter, not
+  the system one. Alpine also ships no timezone database by default, which
+  would silently drop the schedule onto system local time — the `tzdata`
+  package in `requirements.txt` covers it.
+* **SPI and 1-Wire are enabled by hand.** No `raspi-config`, so `dtparam=spi=on`
+  and `dtoverlay=w1-gpio` are appended to whichever of `/boot/usercfg.txt`,
+  `/boot/config.txt` or `/boot/firmware/config.txt` exists (remounting `/boot`
+  read-write first), and `spi-bcm2835`, `w1-gpio` and `w1-therm` go into
+  `/etc/modules`. This needs a reboot, and the installer says so.
+* **It runs as root by default.** Alpine ships none of the udev rules that make
+  `/dev/gpiomem` and `/dev/spidev*` reachable from an unprivileged account.
+  Change `BOILERROOM_USER` in `/etc/conf.d/boilerroom-edge` once you have rules
+  that make a non-root account work.
+
+> **Diskless installs will lose everything.** Alpine's diskless mode runs the
+> root filesystem from RAM and writes nothing back unless you `lbu commit`.
+> This agent is built around outliving power cuts — cached schedule, cached
+> config, credentials, a month of readings — and in RAM every one of those is
+> gone at the next boot, while the reading database grows until it exhausts
+> memory. The installer detects this and makes you type `bench` to continue.
+> For a real boiler room, use a sys install (`setup-disk`) or put the checkout
+> on persistent storage.
+
+Paths and the interpreter live in `/etc/conf.d/boilerroom-edge`; the init
+script at `/etc/init.d/boilerroom-edge` is copied verbatim and needs no
+editing.
 
 ```bash
 sudo systemctl status boilerroom-edge
