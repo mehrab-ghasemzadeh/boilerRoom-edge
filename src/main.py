@@ -6,7 +6,15 @@ import asyncio
 import logging
 import signal
 
-from auth import AuthError, MissingCredentialsError, token_manager
+from auth import (
+    AuthError,
+    MissingCredentialsError,
+    credentials_rejected,
+    credentials_unsaved,
+    forget_credentials,
+    save_credentials,
+    token_manager,
+)
 from control_menu import run_control_menu
 from data_logger import reading_store, save_readings
 from device_config import ConfigError, config_store, load_cached_config
@@ -66,6 +74,10 @@ if USE_MOCK_HARDWARE:
     # has been. BOILERROOM_KEYPAD_EMULATE=on restricts it to the keys the real
     # keypad has, to find prompts the device could not answer.
     from mock_keypad import MockKeypad as Keypad
+    # And shown on a terminal, unless BOILERROOM_DISPLAY=mock asks for the
+    # panel's own screens to be drawn in it — which is the only way to see
+    # them without the hardware in front of you.
+    from mock_display import MockDisplay as Display
 else:
     from temperature_reader import TemperatureReader
     from gas_reader import GasReader
@@ -73,6 +85,8 @@ else:
     # The installed device has no keyboard: the menu is answered on the matrix
     # keypad wired to the header.
     from keypad import Keypad
+    # And shown on the ST7920 panel on the SPI header, beside the gas ADC.
+    from display import ST7920Display as Display
 
 
 async def print_startup_banner(state: RuntimeState) -> None:
@@ -220,28 +234,77 @@ async def auth_loop(state: RuntimeState) -> None:
     reboots during an outage still has to run its heating programme from the
     cached schedule. Everything that needs a session waits on
     ``state.authenticated`` instead of blocking the boot.
+
+    A device with no credentials at all waits for an operator to type them at
+    the panel rather than giving up for the run. This task cannot ask — it has
+    no screen — so it raises ``credentials_needed`` and waits; the control menu
+    asks and answers with ``credentials_ready``. See the credentials wizard in
+    ``control_menu``.
     """
     delay = AUTH_RETRY_DELAY_SECONDS
+    asked = False
 
     while not state.shutdown.is_set():
         try:
             session = await token_manager.login()
-            state.authenticated.set()
-            await state.log(
-                f"[auth] Device session established "
-                f"(device_id={session.device_id or 'unknown'})"
-            )
-            return
         except MissingCredentialsError as exc:
-            await state.log(f"[auth] {exc}")
-            await state.log("[auth] Running offline — telemetry and commands disabled")
-            return
+            if not asked:
+                asked = True
+                await state.log(f"[auth] {exc}")
+                await state.log(
+                    "[auth] Waiting for them to be entered on the device — "
+                    "running offline from the cached schedule until then"
+                )
+            state.credentials_ready.clear()
+            state.credentials_needed.set()
+            if not await state.wait_credentials():
+                return
+            continue
         except AuthError as exc:
+            # Wrong credentials and an unreachable server both land here, and
+            # they want opposite things: one needs the operator, the other
+            # needs patience. Only ask again about credentials this device was
+            # given by hand and has not saved — a server refusing a paired
+            # device is a different fault, and one this must not respond to by
+            # throwing away the only copy of its credentials.
+            if credentials_unsaved() and credentials_rejected(exc):
+                await state.log(
+                    f"[auth] The server refused those credentials ({exc}) — "
+                    "asking for them again",
+                    level=logging.WARNING,
+                )
+                forget_credentials()
+                asked = False
+                state.authenticated.clear()
+                continue
+
             await state.log(f"[auth] Login failed: {exc}", level=logging.WARNING)
             await state.log(
                 f"[auth] Retrying in {delay:.0f}s — "
                 "running from cached schedule until then"
             )
+        else:
+            state.authenticated.set()
+            state.credentials_needed.clear()
+            await state.log(
+                f"[auth] Device session established "
+                f"(device_id={session.device_id or 'unknown'})"
+            )
+            # Proven, so now it is worth keeping. Never before: a credential
+            # that has not logged in once might be a typo, and one written to
+            # .env is one nobody at the panel can correct.
+            try:
+                saved = await save_credentials()
+            except Exception as exc:
+                await state.log(
+                    f"[auth] Logged in, but the credentials could not be saved: "
+                    f"{exc} — this device will ask again at the next boot",
+                    level=logging.WARNING,
+                )
+            else:
+                if saved is not None:
+                    await state.log(f"[auth] Credentials saved to {saved}")
+            return
 
         try:
             await asyncio.wait_for(state.shutdown.wait(), timeout=delay)
@@ -572,6 +635,17 @@ async def main() -> None:
         await state.log(
             f"[menu] Keypad not configured: {exc} — the menu falls back to "
             "the keyboard, if there is one",
+            level=logging.ERROR,
+        )
+
+    # The panel the menu is drawn on, constructed and started the same way and
+    # for the same reason: a device with no display still runs the heating.
+    try:
+        state.display = Display()
+    except Exception as exc:
+        await state.log(
+            f"[menu] Display not configured: {exc} — the menu falls back to "
+            "the terminal, if there is one",
             level=logging.ERROR,
         )
 

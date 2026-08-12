@@ -14,17 +14,42 @@ Every prompt therefore has to be answerable from sixteen keys. The menus were
 already numeric; what needed work was the free text around them, and the
 parsers now take a digit form of each — days as 1-7, a time as HHMM, a date as
 YYYYMMDD — alongside the words. See ``keypad_layout`` for the key table.
+
+The graphical display
+---------------------
+Where one is fitted, the same menu is shown on it instead: one highlighted row
+at a time, moved with ``2`` and ``8``, opened with ``#`` and left with ``*``,
+with a legend along the bottom saying so. The functions below did not have to
+change for it. Two things carry them across:
+
+  * the option tables are the menu, and both faces are built from them — the
+    numbered text for a terminal, the selectable list for the panel, so the two
+    cannot drift apart
+  * everything written with ``state.echo`` is captured rather than printed, and
+    shown a screenful at a time the moment something asks for input
+
+Which means a screen with six rows and a screen with fifty show the same
+things, and there is one implementation of what those things are.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import os
 import sys
 from pathlib import Path
 
-from auth import API_BASE_URL, DEVICE_USERNAME, WS_BASE_URL, token_manager
+from auth import (
+    API_BASE_URL,
+    WS_BASE_URL,
+    CredentialError,
+    credentials_present,
+    device_username,
+    set_credentials,
+    token_manager,
+)
 from config import GAS_SENSORS, RELAYS, TEMPERATURE_SENSORS, UNITS, load_device_mapping
 from config_editor import (
     LIMIT_FIELDS,
@@ -48,9 +73,12 @@ from device_record import (
     fetch_device_record,
     save_cached_device_record,
 )
+from display_font import DEGREE
+from keypad_layout import CANCEL, ENTER, cap_for
 from mapping_provider import DEFAULT_MAPPING_PATH, DEFAULT_SOURCE
 from limits_guard import limit_guard
 from runtime_state import RuntimeState
+from screen import SCROLL_KEYS, Screen
 from schedule_editor import (
     ScheduleEditError,
     add_exception,
@@ -113,11 +141,69 @@ SCHEDULE_MENU = """
   0) Back
 > """
 
+# The same options as the blocks above, as (answer, short label). The terminal
+# reads the block; the display builds a selectable list from these. Labels are
+# written to fit twenty columns, which is what the panel has.
+MAIN_ITEMS = (
+    ("1", "Sensor readings"),
+    ("2", "Device mapping"),
+    ("3", "App configuration"),
+    ("4", "Active schedule"),
+    ("5", "Server record"),
+    ("6", "Relay control"),
+    ("7", "Unit modes"),
+    ("8", "Reload mapping"),
+    ("9", "Change schedule"),
+    ("10", "Temperatures"),
+    ("0", "Quit"),
+)
+
+TEMPERATURE_ITEMS = (
+    ("1", "Set boiler temp"),
+    ("2", "Clear boiler temp"),
+    ("3", "Safety limits"),
+    ("0", "Back"),
+)
+
+LIMITS_ITEMS = (
+    ("1", "Max water temp"),
+    ("2", "Min water temp"),
+    ("3", "Max ambient temp"),
+    ("4", "Discard local edits"),
+    ("0", "Back"),
+)
+
+SCHEDULE_ITEMS = (
+    ("1", "Add weekly rule"),
+    ("2", "Remove weekly rule"),
+    ("3", "Add date exception"),
+    ("4", "Remove exception"),
+    ("5", "Discard local edits"),
+    ("0", "Back"),
+)
+
+# Returned when the operator pressed the back key rather than choosing
+# anything. Distinct from "0" because on the main menu "0" is Quit, and a back
+# key that stops the heating agent is not a back key.
+BACK = "\x00back"
+
 
 # The device answers are read from. A module-level handle, like the schedule
 # and config stores, so the twenty-odd call sites of _prompt keep their
 # signature instead of threading it through every menu function.
 _input_device = None
+
+# The panel those answers are shown on, or None where there is no display and
+# the menu is a terminal one. Held here for the same reason.
+_screen: Screen | None = None
+
+# The state, for the handful of helpers below that need it and are called from
+# places whose signature is fixed by twenty existing call sites.
+_state: RuntimeState | None = None
+
+# What the screen currently being drawn is about, used to title the pages that
+# menu output is shown on. Set from the option label as each one is opened.
+_context = "Menu"
 
 
 def set_input_device(device) -> None:
@@ -134,8 +220,147 @@ def input_device():
     return _input_device
 
 
-async def _prompt(text: str) -> str:
-    return (await input_device().read_line(text)).strip()
+def set_screen(screen: Screen | None) -> None:
+    global _screen
+    _screen = screen
+
+
+def screen() -> Screen | None:
+    """The display's screens, or None when the menu is a terminal one."""
+    return _screen
+
+
+def _set_context(title: str) -> None:
+    global _context
+    _context = title
+
+
+def _label_for(items: tuple[tuple[str, str], ...], answer: str, default: str) -> str:
+    for value, label in items:
+        if value == answer:
+            return label
+    return default
+
+
+def _strip_tag(line: str) -> str:
+    """Drop the ``[menu]`` prefix — on twenty columns it is four wasted words."""
+    return line[7:] if line.startswith("[menu] ") else line
+
+
+async def _flush_page(state: RuntimeState) -> None:
+    """
+    Show whatever the menu has written since the last screen, then clear it.
+
+    Called before anything asks for input, which is what turns output written
+    for a scrolling terminal into pages on a panel that does not scroll:
+    everything a function echoed is on screen, in order, and paged through at
+    the operator's speed rather than gone by the time they look up.
+    """
+    view = screen()
+    if view is None:
+        return
+
+    lines = [_strip_tag(line) for line in state.take_echo()]
+
+    # A page waits for a keypress. On the way out there is nobody to press one,
+    # and the buffer would hold the agent open on a screen saying it is closing.
+    if state.shutdown.is_set() or not any(line.strip() for line in lines):
+        return
+
+    await view.page(_context, lines)
+
+
+async def _prompt(text: str, *, mask: bool = False) -> str:
+    """
+    Ask a question and read the answer.
+
+    ``mask`` hides what is typed, which only the device password wants. It has
+    no effect on a terminal, where the keyboard's own echo is doing the showing
+    and there is no panel to hide it on.
+    """
+    view = screen()
+    if view is None:
+        return (await input_device().read_line(text)).strip()
+
+    if _state is not None:
+        await _flush_page(_state)
+    return (await view.read_line(text, title=_context, mask=mask)).strip()
+
+
+async def _notice(state: RuntimeState, title: str, lines: list[str]) -> None:
+    """
+    Put something on the panel and carry straight on.
+
+    For the screens nobody should have to acknowledge — "checking with the
+    server" while a login runs. ``_flush_page`` would stop and wait for a key,
+    which is right for output an operator asked for and wrong for a thing that
+    is about to replace itself.
+    """
+    view = screen()
+    if view is None:
+        for line in lines:
+            await state.echo(line)
+        return
+
+    _set_context(title)
+    state.take_echo()  # these are on the panel now, not queued behind it
+    await view.splash(title, lines)
+
+
+async def _message(state: RuntimeState, title: str, lines: list[str]) -> None:
+    """Show something the operator has to read, and wait for them to move on."""
+    view = screen()
+    if view is None:
+        for line in lines:
+            await state.echo(line)
+        return
+
+    _set_context(title)
+    state.take_echo()
+    await view.page(title, lines)
+
+
+async def _choose(
+    state: RuntimeState,
+    title: str,
+    items: tuple[tuple[str, str], ...],
+    text: str,
+    *,
+    hide_back: bool = True,
+    legend: tuple[tuple[str, str], ...] | None = None,
+) -> str:
+    """
+    Ask which option. Returns the answer the handlers already expect.
+
+    On a terminal this is the numbered block and a typed number, unchanged. On
+    the panel it is a selectable list — with the "Back" row left out, because
+    the back key is right there on the keypad and a list that spends one of its
+    six rows saying so is a list with five rows.
+    """
+    view = screen()
+    if view is None:
+        return await _prompt(text)
+
+    await _flush_page(state)
+
+    shown = [item for item in items if not (hide_back and item[0] == "0")]
+    index = _last_choice.get(title, 0)
+    chosen = await view.select(
+        title,
+        [label for _, label in shown],
+        index=min(index, len(shown) - 1),
+        legend=legend,
+    )
+    if chosen is None:
+        return BACK
+
+    _last_choice[title] = chosen
+    return shown[chosen][0]
+
+
+# Where each menu was left, so coming back from a submenu lands on the row it
+# was opened from rather than at the top.
+_last_choice: dict[str, int] = {}
 
 
 def _is_yes(answer: str) -> bool:
@@ -281,7 +506,7 @@ async def _show_app_config(state: RuntimeState) -> None:
     await state.echo(f"  API base URL:     {API_BASE_URL}")
     await state.echo(f"  WebSocket URL:    {WS_BASE_URL}")
     session = token_manager.session
-    await state.echo(f"  Device username:  {DEVICE_USERNAME or '(not set)'}")
+    await state.echo(f"  Device username:  {device_username() or '(not set)'}")
     await state.echo(f"  Device ID:        {session.device_id if session else '(not logged in)'}")
     await state.echo(f"  Read interval:    {interval:.0f}s")
     await state.echo(f"  Telemetry every:  {telemetry_interval:.0f}s")
@@ -820,13 +1045,16 @@ async def _schedule_editor_menu(state: RuntimeState) -> None:
     the server publishes a schedule, which then wins.
     """
     while not state.shutdown.is_set():
+        _set_context("Schedule")
         await _schedule_status(state)
 
         try:
-            choice = await _prompt(SCHEDULE_MENU)
+            choice = await _choose(state, "Schedule", SCHEDULE_ITEMS, SCHEDULE_MENU)
         except EOFError:
             state.shutdown.set()
             return
+
+        _set_context(_label_for(SCHEDULE_ITEMS, choice, "Schedule"))
 
         if choice == "1":
             await _add_weekly_rule(state)
@@ -838,11 +1066,13 @@ async def _schedule_editor_menu(state: RuntimeState) -> None:
             await _remove_exception(state)
         elif choice == "5":
             await _discard_local_edits(state)
-        elif choice in ("0", ""):
+        elif choice in ("0", "", BACK):
             await state.echo("")
             return
         else:
             await state.echo(f"\n[menu] Unknown option: {choice!r}\n")
+
+        await _flush_page(state)
 
 
 # ---------------------------------------------------------------------------
@@ -1041,13 +1271,18 @@ async def _temperature_menu(state: RuntimeState) -> None:
     a boiler with no temperature of its own.
     """
     while not state.shutdown.is_set():
+        _set_context("Temperatures")
         await _show_temperature_status(state)
 
         try:
-            choice = await _prompt(TEMPERATURE_MENU)
+            choice = await _choose(
+                state, "Temperatures", TEMPERATURE_ITEMS, TEMPERATURE_MENU
+            )
         except EOFError:
             state.shutdown.set()
             return
+
+        _set_context(_label_for(TEMPERATURE_ITEMS, choice, "Temperatures"))
 
         if choice == "1":
             await _set_boiler_temperature(state)
@@ -1055,11 +1290,13 @@ async def _temperature_menu(state: RuntimeState) -> None:
             await _clear_boiler_temperature(state)
         elif choice == "3":
             await _limits_menu(state)
-        elif choice in ("0", ""):
+        elif choice in ("0", "", BACK):
             await state.echo("")
             return
         else:
             await state.echo(f"\n[menu] Unknown option: {choice!r}\n")
+
+        await _flush_page(state)
 
 
 async def _show_limits_status(state: RuntimeState) -> None:
@@ -1212,24 +1449,29 @@ async def _limits_menu(state: RuntimeState) -> None:
     Edits hold until the server publishes a config, which then wins.
     """
     while not state.shutdown.is_set():
+        _set_context("Safety limits")
         await _show_limits_status(state)
 
         try:
-            choice = await _prompt(LIMITS_MENU)
+            choice = await _choose(state, "Safety limits", LIMITS_ITEMS, LIMITS_MENU)
         except EOFError:
             state.shutdown.set()
             return
+
+        _set_context(_label_for(LIMITS_ITEMS, choice, "Safety limits"))
 
         if choice in ("1", "2", "3"):
             field, label = LIMIT_FIELDS[int(choice) - 1]
             await _change_limit(state, field, label)
         elif choice == "4":
             await _discard_local_limits(state)
-        elif choice in ("0", ""):
+        elif choice in ("0", "", BACK):
             await state.echo("")
             return
         else:
             await state.echo(f"\n[menu] Unknown option: {choice!r}\n")
+
+        await _flush_page(state)
 
 
 async def _show_device_record(state: RuntimeState) -> None:
@@ -1350,9 +1592,460 @@ async def _start_input_device(state: RuntimeState):
     return fallback
 
 
+# ---------------------------------------------------------------------------
+# The graphical display
+# ---------------------------------------------------------------------------
+
+
+# On the main menu there is nothing to go back to, so the back key is given the
+# screen an operator standing at the boiler wants most.
+ROOT_LEGEND = (SCROLL_KEYS, (cap_for(ENTER), "Open"), (cap_for(CANCEL), "Status"))
+
+# How often the status screen redraws itself when there is no keypad to ask for
+# it. Matched to the sensor cadence: anything faster redraws the same numbers.
+STATUS_REFRESH_SECONDS = 30.0
+
+
+def _short_reason(reason: str) -> str:
+    """A cut-out reason that fits twenty columns."""
+    return {
+        "water_over_temperature": "water too hot",
+        "ambient_over_temperature": "room too hot",
+    }.get(reason, reason.replace("_", " "))
+
+
+def _role_reading(temperatures: dict, role: str) -> float | None:
+    for sensor_id, value in temperatures.items():
+        if value is None:
+            continue
+        if TEMPERATURE_SENSORS.get(sensor_id, {}).get("role") == role:
+            return value
+    return None
+
+
+async def _status_lines(state: RuntimeState) -> list[str]:
+    """
+    What the room is doing, in twenty columns.
+
+    The one screen worth designing around: it is what is on the panel when
+    nobody is in a menu, and what an operator checks before touching anything.
+    So it leads with the units — temperature, relay, and who is driving them —
+    and a boiler held off by the limit guard says so where its mode would be,
+    because that is the answer to "why is it not firing".
+    """
+    from limits_guard import _control_temperature
+
+    snapshot = await state.get_snapshot()
+    temperatures = snapshot["temperatures"]
+    modes = await state.get_modes()
+    blocks = await state.get_limit_blocks()
+    setpoints = await state.get_setpoints()
+    ws = await state.get_ws_status()
+    relay_controller = state.relay_controller
+
+    if ws["connected"]:
+        link = "online"
+    elif state.authenticated.is_set():
+        link = "no socket"
+    else:
+        link = "offline"
+
+    config_version, schedule_version = await state.get_active_versions()
+    lines = [f"Link {link}", f"Cfg v{config_version}  Sched v{schedule_version}", ""]
+
+    targets = _controllable_targets()
+    if not targets:
+        lines.append("No device mapping —")
+        lines.append("waiting for the server")
+        return lines
+
+    for target in targets:
+        relay_id = relay_for_target(target)
+        tag = f"{target.type[0].upper()}{target.index}"
+
+        temperature = (
+            _control_temperature(f"pot_{target.index}", temperatures)
+            if target.type == "boiler"
+            else None
+        )
+        reading = f"{temperature:5.1f}{DEGREE}C" if temperature is not None else " " * 7
+
+        if relay_controller is not None and relay_id is not None:
+            switch = "ON " if relay_controller.get_state(relay_id) else "OFF"
+        else:
+            switch = "  ?"
+
+        if target in blocks:
+            mode = "CUT"
+        else:
+            mode = "MAN" if modes.get(target, "automatic") == "manual" else "AUT"
+
+        lines.append(f"{tag:<3}{reading} {switch} {mode}")
+
+    for target, reason in sorted(blocks.items(), key=str):
+        lines.append(f"  {target} cut:")
+        lines.append(f"    {_short_reason(reason)}")
+
+    for index, entry in sorted(setpoints.items()):
+        published = "" if entry.published else " (unsent)"
+        lines.append(f"Target B{index} {entry.temperature_c:.1f}{DEGREE}C{published}")
+
+    lines.append("")
+    inside = _role_reading(temperatures, "environment_inside")
+    outside = _role_reading(temperatures, "environment_outside")
+    if inside is not None:
+        lines.append(f"Inside  {inside:5.1f}{DEGREE}C")
+    if outside is not None:
+        lines.append(f"Outside {outside:5.1f}{DEGREE}C")
+
+    for sensor_id, value in sorted(snapshot["gas"].items()):
+        lines.append(f"Gas {sensor_id}   {value}")
+
+    read_at = snapshot["read_at"]
+    lines.append(f"Read {read_at:%H:%M:%S}Z" if read_at else "No readings yet")
+
+    return lines
+
+
+async def _show_status(state: RuntimeState) -> None:
+    view = screen()
+    if view is None:
+        return
+    _set_context("Status")
+    await view.page("Status", await _status_lines(state))
+
+
+async def _confirm_quit(state: RuntimeState) -> bool:
+    """
+    Check before stopping the agent.
+
+    Not paranoia about one extra keypress: the selection wraps, so "Quit" is
+    one press *up* from the top of the main menu. Nothing else on this device
+    is one slip away from stopping the heating.
+    """
+    view = screen()
+    if view is None:
+        return True  # the terminal menu needs a typed "0", which is confirmation enough
+
+    chosen = await view.select(
+        "Stop the agent?",
+        ["No, keep running", "Yes, stop it"],
+        index=0,
+    )
+    return chosen == 1
+
+
+async def _start_screen(state: RuntimeState, device) -> Screen | None:
+    """
+    Bring up the panel, tolerating not having one.
+
+    Same rule as the keypad: a display that will not start costs the operator a
+    screen and nothing else. The boilers are running a programme and the server
+    can still drive them, so this logs loudly and hands the menu back to the
+    terminal.
+    """
+    display = getattr(state, "display", None)
+    if display is None or not getattr(display, "available", True):
+        return None
+
+    if not hasattr(device, "read_key"):
+        # These screens move a selection; they need the keys one at a time.
+        await state.log(
+            f"[menu] The {device.name} cannot report single keys — the display "
+            "stays dark and the menu stays on the terminal",
+            level=logging.WARNING,
+        )
+        return None
+
+    try:
+        await display.start()
+    except Exception as exc:
+        await state.log(
+            f"[menu] The {getattr(display, 'name', 'display')} could not be "
+            f"started: {exc} — the menu falls back to the terminal",
+            level=logging.ERROR,
+        )
+        return None
+
+    for line in getattr(display, "describe", list)():
+        await state.log(f"[menu] {line}")
+
+    view = Screen(display, device, echo=state.write)
+    set_screen(view)
+    await view.splash("Boiler room", ["", "  Starting up ...", ""])
+    return view
+
+
+async def _stop_screen(state: RuntimeState) -> None:
+    view = screen()
+    set_screen(None)
+    state.stop_echo_capture()
+    if view is None:
+        return
+
+    try:
+        # Leave something true on the glass. A menu frozen where the operator
+        # last left it reads as a working device.
+        await view.splash("Boiler room", ["", "  Agent stopped.", ""])
+        await view.display.close()
+    except Exception as exc:
+        await state.log(f"[menu] Display shutdown: {exc}", level=logging.DEBUG)
+
+
+async def _run_status_display(state: RuntimeState, view: Screen) -> None:
+    """
+    Hold the status screen up when there is no way to answer a menu.
+
+    The case this is for: a device whose keypad would not start. It still has a
+    panel, and an operator in front of it should see temperatures rather than
+    nothing. Longer status pages rotate a screenful at a time, since there is
+    no key to scroll them with.
+    """
+    offset = 0
+
+    while not state.shutdown.is_set():
+        try:
+            lines = await _status_lines(state)
+            window = lines[offset : offset + 6] or lines[:6]
+            await view.splash(
+                "Status",
+                window,
+                legend=((cap_for(ENTER), "no keypad fitted"),),
+            )
+        except Exception as exc:
+            await state.log(
+                f"[menu] Could not draw the status screen: {exc}",
+                level=logging.WARNING,
+            )
+            return
+
+        offset = offset + 6 if offset + 6 < len(lines) else 0
+
+        try:
+            await asyncio.wait_for(state.shutdown.wait(), timeout=STATUS_REFRESH_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# First boot: the device's credentials
+# ---------------------------------------------------------------------------
+#
+# A device is provisioned with a numeric username and password. Putting them in
+# .env means a laptop, an SD card reader or an SSH session at the point of
+# installation; typing them at the panel means neither. So a device that has
+# none asks for them, once, and keeps what it is given.
+#
+# Two rules make that safe to do at a keypad:
+#
+#   * nothing is written to .env until a login has actually succeeded with it,
+#     because an installer eventually mistypes a digit and a device that cached
+#     the typo is one nobody at the panel could correct
+#   * a refusal is told apart from an unreachable server, so a typo asks again
+#     and an outage does not
+
+
+# How long to wait for the server's verdict before letting the operator go. A
+# login gets 30 s to time out, and the auth task's first retry is 10 s after
+# that; past this it is the network, not the answer.
+CREDENTIAL_CHECK_SECONDS = 45.0
+
+# Whether this operator has already been shown the wizard, so declining it is
+# not answered by asking again immediately.
+_credentials_asked = False
+
+
+def _credentials_wanted(state: RuntimeState) -> bool:
+    """Whether to put the credentials wizard in front of somebody now."""
+    # credentials_needed means the auth task asked, which happens at first boot
+    # and again whenever the server refuses something typed here. Checked
+    # alongside the live state rather than instead of it: at boot the menu can
+    # reach its loop before the auth task has had a chance to raise its hand.
+    if state.credentials_needed.is_set():
+        return True
+    return not credentials_present() and not _credentials_asked
+
+
+async def _credentials_wizard(state: RuntimeState) -> None:
+    """
+    Ask for the device's credentials and hand them to the auth task.
+
+    Loops while the server keeps refusing what is typed, since that is exactly
+    the case an installer needs to be able to correct on the spot. Leaves as
+    soon as the credentials are accepted, or as soon as it is clear the server
+    cannot be reached to ask — in which case they stay in memory, the agent
+    keeps retrying in the background, and they are saved the moment one of
+    those retries succeeds.
+    """
+    global _credentials_asked
+
+    _credentials_asked = True
+
+    # Every screen below is written to fit the panel's six rows, so each one is
+    # a single key to move past rather than something to be paged through
+    # before you are allowed to start typing.
+    await _message(
+        state,
+        "Sign in",
+        [
+            "Not signed in yet.",
+            "",
+            "Type the username",
+            "and password from",
+            "provisioning.",
+            "Digits only.",
+        ],
+    )
+
+    while not state.shutdown.is_set():
+        state.credentials_needed.clear()
+        state.credentials_ready.clear()
+        _set_context("Sign in")
+
+        username = await _prompt("Device username: ")
+        if not username:
+            await _declined(state)
+            return
+
+        password = await _prompt("Device password: ", mask=True)
+        if not password:
+            await _declined(state)
+            return
+
+        try:
+            set_credentials(username, password)
+        except CredentialError as exc:
+            await _message(
+                state, "Sign in", ["Cannot use that:", "", str(exc)]
+            )
+            continue
+
+        # The auth task is waiting on this, and it is the only thing here that
+        # knows how to log in.
+        state.credentials_ready.set()
+        await _notice(state, "Sign in", ["", "  Checking with the", "  server ..."])
+
+        outcome = await _credential_outcome(state)
+
+        if outcome == "accepted":
+            await state.log(f"[menu] Signed in as {username}, entered on the device")
+            await _message(
+                state,
+                "Sign in",
+                [
+                    "Accepted.",
+                    "",
+                    "Saved here. You will",
+                    "not be asked again.",
+                ],
+            )
+            return
+
+        if outcome == "rejected":
+            await state.log(
+                "[menu] The server refused the credentials entered on the device",
+                level=logging.WARNING,
+            )
+            await _message(
+                state,
+                "Sign in",
+                [
+                    "Not accepted.",
+                    "",
+                    "Check the username",
+                    "and password, then",
+                    "try again.",
+                ],
+            )
+            continue
+
+        if outcome == "stopped":
+            return
+
+        await state.log(
+            "[menu] Credentials entered on the device, but the server could not "
+            "be reached to check them — retrying in the background",
+            level=logging.WARNING,
+        )
+        await _message(
+            state,
+            "Sign in",
+            [
+                "No answer from the",
+                "server yet.",
+                "",
+                "Kept and retried in",
+                "the background;",
+                "saved when it works.",
+            ],
+        )
+        return
+
+
+async def _declined(state: RuntimeState) -> None:
+    await state.log(
+        "[menu] Sign-in was cancelled — the device stays offline and runs from "
+        "its cached schedule",
+        level=logging.WARNING,
+    )
+    await _message(
+        state,
+        "Sign in",
+        [
+            "Left unsigned.",
+            "",
+            "The boilers keep to",
+            "the cached schedule.",
+            "Restart to be asked.",
+        ],
+    )
+
+
+async def _credential_outcome(state: RuntimeState) -> str:
+    """
+    Wait for the auth task's verdict on what was just typed.
+
+    ``accepted``, ``rejected``, ``stopped`` or ``unanswered`` — the last
+    meaning the server could not be reached in time to say, which is not a
+    reason to make somebody stand at the panel any longer.
+    """
+    waiters = {
+        "accepted": asyncio.create_task(state.authenticated.wait()),
+        "rejected": asyncio.create_task(state.credentials_needed.wait()),
+        "stopped": asyncio.create_task(state.shutdown.wait()),
+    }
+
+    try:
+        done, _ = await asyncio.wait(
+            waiters.values(),
+            timeout=CREDENTIAL_CHECK_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in waiters.values():
+            if not task.done():
+                task.cancel()
+
+    # Checked in this order so a session that came up wins over anything else
+    # that happened to land in the same moment.
+    for name, task in waiters.items():
+        if task in done:
+            return name
+    return "unanswered"
+
+
+# ---------------------------------------------------------------------------
+# The menu itself
+# ---------------------------------------------------------------------------
+
+
 async def run_control_menu(state: RuntimeState) -> None:
+    global _state
+    _state = state
+
     device = await _start_input_device(state)
     set_input_device(device)
+    view = await _start_screen(state, device)
 
     if not menu_enabled(device):
         await state.log(
@@ -1360,16 +2053,25 @@ async def run_control_menu(state: RuntimeState) -> None:
             "(set BOILERROOM_MENU=on to force it)"
         )
         await device.close()
-        await state.shutdown.wait()
+        if view is None:
+            await state.shutdown.wait()
+            return
+        try:
+            await _run_status_display(state, view)
+        finally:
+            await _stop_screen(state)
         return
 
     try:
         await _run_menu_loop(state, device)
     finally:
+        await _stop_screen(state)
         await device.close()
 
 
 async def _run_menu_loop(state: RuntimeState, device) -> None:
+    view = screen()
+
     for line in getattr(device, "describe", list)():
         await state.echo(line)
 
@@ -1378,23 +2080,63 @@ async def _run_menu_loop(state: RuntimeState, device) -> None:
         "(sensor polling continues in background).\n"
     )
 
+    if view is not None:
+        # From here the menu's output belongs to the panel: captured and shown
+        # a screenful at a time, rather than printed into a journal nobody is
+        # reading while the operator looks at six blank rows.
+        state.capture_echo()
+
+    # The panel opens on the status screen rather than on the menu: it is what
+    # somebody walking up to the device wants to see, and the menu is one key
+    # away from it. Shown from inside the loop so it is covered by the handler
+    # below like every other screen.
+    pending_status = view is not None
+
     while not state.shutdown.is_set():
+        # One handler for the whole step, because every screen below reads
+        # keys and any of them can find the input device gone — stdin closed,
+        # or the keypad shut down. Guarding only some of them is how a heating
+        # agent ends on a traceback because a terminal was closed: this way it
+        # sets shutdown and leaves through main's ordinary path, which releases
+        # the relays and closes the database on the way out.
         try:
-            choice = await _prompt(MENU)
-        except EOFError:
-            state.shutdown.set()
-            break
+            # Before anything else: a device nobody has signed in cannot talk
+            # to the server at all, so it is the first thing to put in front of
+            # whoever is standing here.
+            if _credentials_wanted(state):
+                await _credentials_wizard(state)
+                continue
 
-        if state.shutdown.is_set():
-            break
+            if pending_status:
+                pending_status = False
+                await _show_status(state)
+                continue
 
-        try:
+            _set_context("Main menu")
+            choice = await _choose(
+                state,
+                "Main menu",
+                MAIN_ITEMS,
+                MENU,
+                hide_back=False,
+                legend=ROOT_LEGEND,
+            )
+
+            if state.shutdown.is_set():
+                break
+
+            if choice == BACK:
+                # Nothing sits above the main menu, so the back key is spent on
+                # the screen worth reaching in one press from anywhere.
+                await _show_status(state)
+                continue
+
+            if choice == "0" and not await _confirm_quit(state):
+                continue
+
+            _set_context(_label_for(MAIN_ITEMS, choice, "Menu"))
             await _handle_choice(state, choice)
+            await _flush_page(state)
         except EOFError:
-            # The input device went away part-way through a submenu — stdin
-            # closed, or the keypad was shut down. Only the submenus that
-            # happen to guard their own prompts used to survive it; the rest
-            # took the whole agent down with them, which is a heating system
-            # stopping because a terminal was closed.
             state.shutdown.set()
             break

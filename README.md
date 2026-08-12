@@ -709,10 +709,14 @@ configured value is not the cut-out for a single-probe unit:
 Copy `.env.example` to `.env` and fill in the device credentials. The file is
 git-ignored.
 
+Or leave the credentials out — see
+[Signing in at the panel](#signing-in-at-the-panel), which is how a device with
+no laptop attached gets them.
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `BOILERROOM_DEVICE_USERNAME` | — | Numeric device username from provisioning |
-| `BOILERROOM_DEVICE_PASSWORD` | — | Numeric device password |
+| `BOILERROOM_DEVICE_USERNAME` | — | Numeric device username from provisioning; asked for at the panel if absent |
+| `BOILERROOM_DEVICE_PASSWORD` | — | Numeric device password; likewise |
 | `BOILERROOM_API_BASE_URL` | `https://br.mayanext.com` | REST base |
 | `BOILERROOM_WS_BASE_URL` | `wss://br.mayanext.com` | WebSocket base |
 | `BOILERROOM_WS_ORIGIN` | derived from WS base | `Origin` header for the handshake |
@@ -986,8 +990,20 @@ python src/main.py
 ```
 
 `USE_MOCK_HARDWARE` at the top of [`src/main.py`](src/main.py) selects simulated
-sensors and relays. Set it to `False` on the Pi, and install `RPi.GPIO` and
-`spidev` there.
+sensors, relays, keypad and display. Set it to `False` on the Pi, where there
+are two more packages to install:
+
+```bash
+pip install -r requirements_hardware.txt     # RPi.GPIO and spidev
+```
+
+Nothing in the mock build imports either of them, which is what lets the whole
+agent be developed and tested on a machine with no GPIO header. On Raspberry Pi
+OS Bookworm and later, pip will not install into the system Python that the
+service runs — use `sudo apt install python3-rpi.gpio python3-spidev`, or point
+the service at a virtualenv. See
+[`requirements_hardware.txt`](requirements_hardware.txt), which also lists what
+has to be enabled on the host: SPI, 1-Wire, and the `gpio`/`spi` groups.
 
 Mock temperatures are generated per role — indoor 18–28 °C, outdoor 5–35 °C,
 inlet 30–60 °C, outlet 40–85 °C, body 40–90 °C — so limit enforcement behaves
@@ -1046,6 +1062,11 @@ Sensor polling and the WebSocket keep running while the menu is open — input i
 read off the event loop, on a worker thread for the keyboard and on the
 keypad's own scanning thread for the matrix.
 
+The same options are shown two ways: as the numbered block above on a terminal,
+and as a scroll-and-select list on the graphical display where one is fitted.
+Both are built from one option table, so they cannot drift apart — see
+[The display](#the-display).
+
 Option 3 shows the active config, the limits, which boilers are currently cut,
 and the state of the reading database and the telemetry outbox. Option 5 shows
 the server's record of this device — calibration offsets, disabled probes, and
@@ -1074,16 +1095,28 @@ and a keypad menu drifting apart. Keys go into the answer as they are pressed;
 — which every prompt already reads as "back", so there is no way to get stuck
 in one with no keyboard to hand.
 
-Wiring, and the default key table:
+Wiring, and the default key table. The caps on the pad fitted to this device
+read `1 2 3 A / 4 5 6 B / 7 8 9 C / * 0 # D`, and what each one emits is:
 
 | | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|
-| **A** (GPIO 17) | 1 | 2 | 3 | enter |
-| **B** (GPIO 27) | 4 | 5 | 6 | del |
-| **C** (GPIO 22) | 7 | 8 | 9 | cancel |
-| **D** (GPIO 5) | . | 0 | , | - |
+| **A** (GPIO 17) | `1` | `2` — up | `3` | `A` → del |
+| **B** (GPIO 27) | `4` | `5` | `6` | `B` → . |
+| **C** (GPIO 22) | `7` | `8` — down | `9` | `C` → , |
+| **D** (GPIO 5) | `*` → cancel | `0` | `#` → enter | `D` → - |
 
 Columns 1–4 are GPIO 6, 13, 19 and 26.
+
+`#` accepts and `*` goes back — the two an operator reaches for most, on the
+two keys that are neither digits nor tucked up the right-hand side. That leaves
+A–D for the four remaining functions. On the display `2` and `8` also scroll:
+they sit above and below `5` and read as up and down without anything printed
+on them saying so.
+
+What is printed on a cap and what it emits are separate tables, because the
+legend on the display has to name the printed one — telling an operator to
+press "cancel" is no use when the cap says `*`. `BOILERROOM_KEYPAD_CAPS`
+overrides the printed one, `BOILERROOM_KEYPAD_LAYOUT` the emitted one.
 
 Scanning drives the row pins, so a pin shared with a relay means **a keypress
 switches a boiler**. The keypad checks its pins against the live mapping before
@@ -1140,6 +1173,159 @@ is logged at ERROR and the menu falls back to the keyboard, if there is one.
 It never stops the agent: the boilers are running a heating programme and the
 server can still drive them, and what is lost is the local menu.
 
+### Signing in at the panel
+
+A device is provisioned with a numeric username and password. Putting them in
+`.env` means an SD card reader, a laptop or an SSH session at the moment of
+installation. A device that finds neither set asks for them on the panel
+instead, once, and keeps what it is given:
+
+```
++---------------------+
+|SIGN IN              |
+|Not signed in yet.   |
+|                     |
+|Type the username    |
+|and password from    |
+|provisioning.        |
+|Digits only.         |
+|# Done  * Back       |
++---------------------+
+```
+
+Then the two prompts — the password shown as one dot per digit, since on a
+keypad with no tactile feedback the count is what tells you a press registered.
+The credentials go straight to the task that logs in, and the panel says what
+the server made of them.
+
+**Nothing is written to `.env` until a login has actually succeeded with it.**
+An installer eventually mistypes a digit, and a device that had cached the typo
+would be one nobody at the panel could correct — which is the position this
+whole feature exists to get out of. So the three answers are told apart:
+
+| Server says | What happens |
+|---|---|
+| Accepted | Written to `.env`, mode `0600`. Later boots read it and never ask. |
+| Refused (HTTP 400/401/403) | The credentials are dropped and asked for again, on the spot. |
+| No answer — unreachable | Kept in memory and retried in the background; saved the moment one gets through. |
+
+A refusal is told from an outage on purpose: asking an operator to retype
+something because the network is down would be useless, and quietly retrying a
+typo forever is how a device ends up permanently offline with nobody being told
+why.
+
+Only credentials typed here are ever dropped. Ones already in `.env` are the
+operator's file; a server that starts refusing a paired device is a different
+fault, and wiping the only copy of its credentials would make it much worse.
+
+Cancelling — an empty answer, or `*` — leaves the device unsigned. It keeps
+running the boilers from its cached schedule, which is the whole point of the
+caches, and asks again after a restart. The rest of the menu is reachable
+either way.
+
+Writes to `.env` go through a temp file and a rename, and every other line in
+it — comments, endpoints, tuning — is copied through untouched. It is a
+hand-edited file, and a rewrite that reformatted it would be an unpleasant
+surprise the next time somebody opened it.
+
+### The display
+
+On the installed hardware the menu is shown on an ST7920 128x64 graphical LCD,
+chosen by `USE_MOCK_HARDWARE` like everything else. Wiring:
+
+| ST7920 | Pi | |
+|---|---|---|
+| SID | GPIO10 | MOSI |
+| CLK | GPIO11 | SCLK |
+| CS | GPIO7 | CE1 |
+| VCC | 5V | |
+| GND | GND | |
+
+It shares the SPI bus with the gas ADC, which is on CE0. The chip selects are
+separate and the kernel serialises transfers, so the two do not need to know
+about each other — but they run at different clocks and in different SPI modes,
+so each opens its own handle.
+
+Two things about this controller are easy to get wrong and expensive to debug.
+**PSB must be tied LOW** for serial mode; it is a jumper or a solder pad on the
+module rather than a pin on the five-wire connector, and left high the
+controller is listening for a parallel bus that is not there. And **CS is
+active high**, unlike every other SPI peripheral on the header — the driver
+sets `cshigh`, and `BOILERROOM_DISPLAY_CS_HIGH=off` is there for a panel whose
+chip select is strapped high in hardware instead.
+
+#### What is on it
+
+The screen is 21 characters by 8 rows in a 6x8 cell, which is a title bar, six
+body rows and a legend strip:
+
+```
++---------------------+
+|MAIN MENU        1/11|   title, and where you are in the list
+|Sensor readings      |   <- selected row, shown inverted
+|Device mapping       |
+|App configuration    |  #
+|Active schedule      |  #  <- scroll bar: which slice of eleven
+|Server record        |  #
+|Relay control        |
+|2^ 8v  # Open * Statu|   legend: what the four keys do here
++---------------------+
+```
+
+`2` and `8` move, `#` opens, `*` goes back — and the strip along the bottom
+says so on every screen, so there is none an operator can reach without being
+told the way out of it. The selection wraps at both ends, so the last option is
+one press from the first rather than ten.
+
+Three screens carry everything:
+
+* **Lists** — the menus, one highlighted row at a time, scrolling under the
+  selection with a bar on the right edge showing how far through you are.
+* **Pages** — anything the menu writes. `#` pages forward while there is more
+  below and closes at the bottom, so holding one key reads the whole thing.
+* **Entry** — a prompt with the answer drawn as it is typed, `#` to accept and
+  `A` to rub out.
+
+`*` on the main menu, where there is nothing to go back to, shows the status
+screen instead: link state, and every boiler and pump with its temperature,
+relay and mode. A unit held off by the limit guard reads `CUT` where its mode
+would be, because that is the answer to "why is it not firing".
+
+#### How it fits the existing menu
+
+The menu functions did not change for it. Two things carry them across:
+
+* the option tables *are* the menu, and both faces are built from them — the
+  numbered block for a terminal, the selectable list for the panel — so the two
+  cannot drift apart
+* everything written with `state.echo` is captured rather than printed, and
+  shown a screenful at a time the moment something asks for input
+
+So a screen with six rows and a terminal with fifty show the same things, and
+there is one implementation of what those things are.
+
+One behaviour is new rather than carried over: **Quit asks first**. On a
+terminal it takes a typed `0`; on a wrapping list it is one press *up* from the
+top of the main menu, and nothing else on this device is one slip away from
+stopping the heating.
+
+A display that will not start is logged at ERROR and the menu falls back to the
+terminal, exactly as the keypad falls back to the keyboard, and for the same
+reason. If the *keypad* is what failed, the panel is not wasted: it holds the
+status screen up instead, rotating a screenful at a time, so a device nobody
+can drive by hand still shows what the room is doing.
+
+Refreshes send only the rows that changed. A full frame is about 2.5 KB once
+each byte is split into the two padded nibbles the serial protocol wants —
+25 ms of bus time at 800 kHz — while moving the selection down a menu changes
+two rows and costs about a millisecond.
+
+On the bench, `BOILERROOM_DISPLAY=mock` draws the same frames in the terminal
+and switches the menu to the scroll-and-select interface, so the menu an
+operator will actually use can be exercised without the hardware in front of
+you. Keys are typed as a line: `8` moves down, `88#` moves down twice and
+selects, Enter on its own is `#`.
+
 ---
 
 ## Module map
@@ -1147,7 +1333,7 @@ server can still drive them, and what is lost is the local menu.
 | Module | Role |
 |--------|------|
 | `main.py` | Task startup, sensor loop, schedule loop |
-| `auth.py` | Device login, token lifetime, authenticated REST calls |
+| `auth.py` | Device login, credentials, token lifetime, authenticated REST calls |
 | `ws_client.py` | WebSocket session, message handlers, heartbeat, backoff |
 | `commands.py` | `command.execute` dispatch, idempotency, relay actuation |
 | `schedule_runner.py` | Schedule parsing, evaluation, relay switching, local override |
@@ -1168,7 +1354,11 @@ server can still drive them, and what is lost is the local menu.
 | `record_sync.py` | Adopting the server record — modes, setpoints, calibration, wiring |
 | `control_menu.py` | Interactive control menu, on whichever input device is fitted |
 | `keypad.py` | GPIO matrix keypad: pin setup, scanning thread, bring-up test |
-| `keypad_layout.py` | Keypad pins, key table and line editor — no hardware imports |
+| `keypad_layout.py` | Keypad pins, key table, caps and line editor — no hardware imports |
+| `screen.py` | The display's screens: lists, pages, entry, legend strip |
+| `display.py` | ST7920 128x64 LCD over SPI: init, dirty-row refresh |
+| `display_canvas.py` | 128x64 framebuffer, drawing and text wrapping — no hardware imports |
+| `display_font.py` | The 5x7 bitmap font — no hardware imports |
 | `mapping.py`, `mapping_*.py`, `config.py` | Device mapping load, validation, lookup |
 | `load_env.py` | Minimal `.env` reader (stdlib only) |
 | `temperature_reader.py`, `gas_reader.py`, `relay_controller.py` | Hardware I/O |
@@ -1186,7 +1376,8 @@ WebSocket protocol (hello, heartbeat, config, schedule, commands), schedule-driv
 relay control, config and schedule caching, temperature limit enforcement,
 offline operation, SQLite reading history, rotating log files,
 systemd service, device self-detail with sensor calibration,
-server-derived device mapping, on-device schedule and limit editing.
+server-derived device mapping, on-device schedule and limit editing, and the
+control menu on the matrix keypad and ST7920 display.
 
 The device also publishes schedules upstream over the WebSocket
 (`schedule.update`). All four REST endpoints a device token may call are
@@ -1203,6 +1394,15 @@ Outstanding:
   pins cannot tell you the key table matches the caps on *your* keypad, and
   they cannot bounce the way a membrane does. Run `python src/keypad.py --test`
   on the device first and set `BOILERROOM_KEYPAD_LAYOUT` from what it prints.
+- **The display has not been run against real hardware either.** Every frame
+  the panel would be sent is rendered and checked, and the screens are driven
+  end to end through the real menu with `BOILERROOM_DISPLAY=mock` — but a
+  framebuffer that is right says nothing about whether the controller accepts
+  it. The three things to check first, in order: PSB tied LOW, CS active high,
+  and the SPI clock (drop `BOILERROOM_DISPLAY_SPI_SPEED` if the panel shows
+  torn or shifted rows). Note also that the ST7920 at 5V wants about 3.5 V to
+  read a logic high and the Pi drives 3.3 V; it usually works, and running the
+  panel's VCC at 3.3 V is the usual fix if it does not.
 - **No gas threshold logic.** Gas readings are logged and transmitted, but no
   threshold drives the `alarm` relay or `gas_valve`.
 - **A changed mapping needs a restart.** Relay GPIO pins are configured once at

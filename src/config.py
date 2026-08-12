@@ -17,6 +17,19 @@ SPI_BUS = 0
 SPI_DEVICE = 0
 SPI_SPEED = 1_000_000
 
+# BCM pins the gas ADC occupies: MOSI, SCLK, CE0.
+SPI_GPIO = (10, 11, 8)
+
+# ST7920 128x64 graphical display. Same SPI bus as the gas ADC, its own chip
+# select — the kernel serialises the two, and each opens its own handle because
+# they run at different clocks and in different SPI modes.
+DISPLAY_SPI_BUS = 0
+DISPLAY_SPI_DEVICE = 1  # CE1
+DISPLAY_SPI_SPEED = 800_000
+
+# BCM pins the panel occupies: SID -> MOSI, CLK -> SCLK, CS -> CE1.
+DISPLAY_GPIO = (10, 11, 7)
+
 # Populated by load_device_mapping() at startup
 UNITS: dict[str, dict[str, str]] = {}
 TEMPERATURE_SENSORS: dict[int, dict] = {}

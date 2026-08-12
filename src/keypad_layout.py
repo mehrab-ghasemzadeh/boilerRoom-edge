@@ -33,18 +33,42 @@ Tokens
 Each position emits either a single character, which is appended to whatever is
 being typed, or one of three control tokens:
 
-  ``enter``   accept the line
+  ``enter``   accept the line — and, on the display, select the highlighted row
   ``del``     rub out the last character
-  ``cancel``  abandon the line — every menu reads an empty answer as "back"
+  ``cancel``  go back: every menu reads an empty answer as "back"
 
 Ten digits leaves six keys for the six functions the menus actually need:
 accept, rub out, cancel, ``.`` for a decimal temperature, ``,`` to separate a
 list of units, and ``-`` which is what clears a limit.
+
+The default below matches the pad fitted to this device, whose caps read::
+
+    1 2 3 A
+    4 5 6 B
+    7 8 9 C
+    * 0 # D
+
+so ``#`` accepts and ``*`` goes back — the two the operator reaches for most,
+on the two keys that are not digits and not tucked up the right-hand side. That
+leaves A-D for the four remaining functions. On the graphical display, ``2``
+and ``8`` also scroll: they sit above and below ``5`` and read as up and down
+without anything printed on them saying so.
+
+Caps
+----
+What is printed on a key and what it emits are different things, and the legend
+strip on the display has to name the printed one — telling an operator to press
+"cancel" is no use when the cap says ``*``. ``KEY_CAPS`` is that second table,
+overridable with BOILERROOM_KEYPAD_CAPS in the same format as the layout.
 """
 
 from __future__ import annotations
 
 import os
+
+from logging_setup import get_logger
+
+_log = get_logger("keypad")
 
 # Connector pin -> BCM GPIO. Chosen to avoid the relay pins (18, 23, 24, 25,
 # 12, 16, 20, 21), the 1-Wire bus (4) and the SPI pins the gas ADC uses.
@@ -62,6 +86,11 @@ CONTROL_TOKENS = (ENTER, DEL, CANCEL)
 
 # Spellings accepted in BOILERROOM_KEYPAD_LAYOUT. The layout is comma-separated,
 # so the comma key has to be named rather than written.
+#
+# "#" and "*" are the caps this device's accept and back keys carry, and no
+# prompt anywhere wants either as a character — so they are read as the
+# functions rather than left as two dead keys for whoever writes a layout the
+# obvious way.
 KEY_ALIASES = {
     "dot": ".",
     "point": ".",
@@ -69,11 +98,14 @@ KEY_ALIASES = {
     "comma": ",",
     "minus": "-",
     "dash": "-",
-    "hash": "#",
-    "star": "*",
+    "hash": ENTER,
+    "#": ENTER,
+    "star": CANCEL,
+    "*": CANCEL,
     "ok": ENTER,
     "eq": ENTER,
     "equals": ENTER,
+    "select": ENTER,
     "back": CANCEL,
     "esc": CANCEL,
     "clear": CANCEL,
@@ -81,13 +113,28 @@ KEY_ALIASES = {
     "delete": DEL,
 }
 
-# Row-major, matching DEFAULT_ROW_GPIO x DEFAULT_COL_GPIO.
+# Row-major, matching DEFAULT_ROW_GPIO x DEFAULT_COL_GPIO. See the module
+# docstring for why each key does what it does.
 DEFAULT_LAYOUT = (
-    ("1", "2", "3", ENTER),
-    ("4", "5", "6", DEL),
-    ("7", "8", "9", CANCEL),
-    (".", "0", ",", "-"),
+    ("1", "2", "3", DEL),
+    ("4", "5", "6", "."),
+    ("7", "8", "9", ","),
+    (CANCEL, "0", ENTER, "-"),
 )
+
+# What is printed on each cap, in the same positions. Only ever used to talk to
+# the operator — nothing is decided from it.
+DEFAULT_CAPS = (
+    ("1", "2", "3", "A"),
+    ("4", "5", "6", "B"),
+    ("7", "8", "9", "C"),
+    ("*", "0", "#", "D"),
+)
+
+# Where the display's scroll keys live. Digits like any other, until a screen
+# that scrolls is in front of them.
+SCROLL_UP = "2"
+SCROLL_DOWN = "8"
 
 # An answer longer than this is a stuck key, not an operator. The longest thing
 # any prompt legitimately wants is an 8-digit date.
@@ -180,6 +227,96 @@ def layout() -> tuple[tuple[str, ...], ...]:
     return parse_layout(raw)
 
 
+def parse_caps(raw: str) -> tuple[tuple[str, ...], ...]:
+    """Same grid format as the layout, but the cells are labels, not tokens."""
+    rows: list[tuple[str, ...]] = []
+    for line in raw.replace(";", "/").split("/"):
+        if not line.strip():
+            continue
+        cells = [cell.strip() for cell in line.split(",")]
+        if len(cells) != 4:
+            raise KeypadLayoutError(
+                f"caps row {len(rows) + 1} has {len(cells)} key(s), expected 4"
+            )
+        if not all(cells):
+            raise KeypadLayoutError(f"caps row {len(rows) + 1} has an empty cap")
+        rows.append(tuple(cells))
+
+    if len(rows) != 4:
+        raise KeypadLayoutError(f"expected 4 rows of caps, got {len(rows)}")
+    return tuple(rows)
+
+
+def caps() -> tuple[tuple[str, ...], ...]:
+    """What is printed on the keys: BOILERROOM_KEYPAD_CAPS, or the default."""
+    raw = (os.environ.get("BOILERROOM_KEYPAD_CAPS") or "").strip()
+    if not raw:
+        return DEFAULT_CAPS
+    return parse_caps(raw)
+
+
+_warned_about_tables = False
+
+
+def key_tables() -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    """
+    The layout and the caps, as far as they can be read. **Never raises.**
+
+    Everything that talks *about* the keypad goes through here rather than
+    calling ``layout()`` and ``caps()`` directly: the legend on the display,
+    the layout picture in the menu, and the bench keyboard's key mapping. All
+    of those run before anything has had a chance to validate a thing — the
+    display's legend is built when ``control_menu`` is imported — and a typo in
+    an environment variable must not be able to stop a heating agent from
+    starting.
+
+    Where the configuration being broken actually matters, it is still refused
+    outright: ``Keypad.__init__`` calls ``layout()`` and will not scan a table
+    it cannot read. That is the right place for it, because there the failure
+    means "this keypad cannot be used", and the menu falls back to the
+    keyboard. Here it only means "the legend may name the wrong key".
+    """
+    global _warned_about_tables
+
+    try:
+        return layout(), caps()
+    except KeypadLayoutError as exc:
+        if not _warned_about_tables:
+            _warned_about_tables = True
+            _log.warning(
+                "Using the default key table for on-screen labels — %s. "
+                "The keypad itself will refuse to start until this is fixed.",
+                exc,
+            )
+        return DEFAULT_LAYOUT, DEFAULT_CAPS
+
+
+def cap_for(
+    token: str,
+    grid: tuple[tuple[str, ...], ...] | None = None,
+    cap_grid: tuple[tuple[str, ...], ...] | None = None,
+) -> str:
+    """
+    The cap an operator presses to produce ``token``.
+
+    Falls back to the token itself, so a legend built from a remapped keypad
+    that has lost a function still says something rather than nothing.
+    """
+    if grid is None or cap_grid is None:
+        configured_grid, configured_caps = key_tables()
+        grid = grid or configured_grid
+        cap_grid = cap_grid or configured_caps
+
+    for row_index, row in enumerate(grid):
+        for col_index, cell in enumerate(row):
+            if cell == token:
+                try:
+                    return cap_grid[row_index][col_index]
+                except IndexError:
+                    return token
+    return token
+
+
 def producible_characters(grid: tuple[tuple[str, ...], ...] | None = None) -> set[str]:
     """Every character this keypad can put into an answer."""
     return {
@@ -191,11 +328,25 @@ def producible_characters(grid: tuple[tuple[str, ...], ...] | None = None) -> se
 
 
 def describe(grid: tuple[tuple[str, ...], ...] | None = None) -> list[str]:
-    """The layout as a picture, for the menu and for bring-up."""
-    grid = grid or layout()
-    lines = ["      " + "".join(f"{label:^9}" for label in COL_LABELS)]
-    for label, row in zip(ROW_LABELS, grid):
-        lines.append(f"  {label}   " + "".join(f"{token:^9}" for token in row))
+    """
+    The layout as a picture, for the menu and for bring-up.
+
+    Each cell shows the cap and what that key emits, because the whole class of
+    bug this is here to catch is the two not agreeing.
+    """
+    configured_grid, cap_grid = key_tables()
+    grid = grid or configured_grid
+
+    lines = ["      " + "".join(f"{label:^11}" for label in COL_LABELS)]
+    for row_index, (label, row) in enumerate(zip(ROW_LABELS, grid)):
+        cells = []
+        for col_index, token in enumerate(row):
+            try:
+                cap = cap_grid[row_index][col_index]
+            except IndexError:
+                cap = "?"
+            cells.append(f"{cap}={token}" if cap != token else token)
+        lines.append(f"  {label}   " + "".join(f"{cell:^11}" for cell in cells))
     return lines
 
 

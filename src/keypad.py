@@ -108,9 +108,11 @@ class Keypad:
         under a device that was correctly configured when it was installed.
 
         Only meaningful once a mapping exists; an unpaired device has no relays
-        to clash with yet.
+        to clash with yet. The fixed buses are checked whatever the mapping
+        says: driving a row pin that is also SPI clock does not just break the
+        keypad, it takes the gas ADC and the display down with it.
         """
-        from config import ONE_WIRE_GPIO, RELAYS
+        from config import DISPLAY_GPIO, ONE_WIRE_GPIO, RELAYS, SPI_GPIO
 
         mine = set(self._rows) | set(self._cols)
         clashes: dict[int, str] = {}
@@ -122,6 +124,13 @@ class Keypad:
 
         if ONE_WIRE_GPIO in mine:
             clashes[ONE_WIRE_GPIO] = "the 1-Wire temperature bus"
+
+        for pin in SPI_GPIO:
+            if pin in mine:
+                clashes[pin] = "the SPI bus the gas ADC uses"
+        for pin in DISPLAY_GPIO:
+            if pin in mine:
+                clashes[pin] = "the SPI bus the display uses"
 
         return clashes
 
@@ -245,9 +254,32 @@ class Keypad:
 
     # -- reading -------------------------------------------------------------
 
+    async def read_key(self) -> str:
+        """
+        One keypress, as a token.
+
+        What the graphical display's screens are driven by: they move a
+        selection rather than collecting an answer, so they want the keys one
+        at a time instead of a finished line.
+
+        Raises EOFError once the keypad is closed, which is what the menu loop
+        already treats as "no input device left".
+        """
+        if self._queue is None:
+            raise EOFError("keypad is not running")
+
+        key = await self._queue.get()
+        if key is _CLOSED:
+            raise EOFError("keypad closed")
+        return key
+
     async def read_line(self, prompt: str) -> str:
         """
         Collect keypresses into one answer, the way ``input()`` collects typing.
+
+        Used where there is no display to draw the answer on. With one fitted,
+        ``screen.read_line`` does the same job on top of ``read_key``, and
+        shows the buffer on the panel instead of on a terminal nobody has.
 
         Raises EOFError once the keypad is closed, which is what the menu loop
         already treats as "no input device left".
@@ -264,9 +296,7 @@ class Keypad:
         tail = prompt.rsplit("\n", 1)[-1]
 
         while True:
-            key = await self._queue.get()
-            if key is _CLOSED:
-                raise EOFError("keypad closed")
+            key = await self.read_key()
             if editor.feed(key):
                 break
             # Rewritten in place so the buffer is visible on a console or over

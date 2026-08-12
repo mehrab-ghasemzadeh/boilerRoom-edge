@@ -25,6 +25,15 @@ class RuntimeState:
         # Set once a device session exists. Until then the agent runs offline
         # from its cached schedule; telemetry and the WebSocket wait for it.
         self.authenticated = asyncio.Event()
+        # The two halves of asking an operator for the device's credentials.
+        # The auth task cannot ask — it has no screen — and the control menu
+        # cannot log in, so they pass it between them: auth raises its hand
+        # with ``credentials_needed``, the menu answers with
+        # ``credentials_ready``, and auth reports back by setting
+        # ``authenticated`` or raising its hand again.
+        self.credentials_needed = asyncio.Event()
+        self.credentials_ready = asyncio.Event()
+
         # Set once a usable device mapping exists. The wiring comes from the
         # server record, so a device that has never been paired has nothing to
         # drive until one arrives — the sensor loop waits on this rather than
@@ -46,6 +55,16 @@ class RuntimeState:
         # installed device, the keyboard on the bench. Set by main from the
         # same USE_MOCK_HARDWARE switch as the readers above.
         self.keypad = None
+        # Where it is shown: the ST7920 panel on the installed device, nothing
+        # at all on the bench unless asked for. Set by main from the same
+        # switch.
+        self.display = None
+
+        # When set, echo() collects lines here instead of printing them. The
+        # menu turns this on so the output written for a terminal can be shown
+        # on the panel a screen at a time — six rows of it does not scroll past
+        # and cannot be paged back to.
+        self._echo_sink: list[str] | None = None
 
         self._ws_lock = asyncio.Lock()
         self.ws_connected = False
@@ -114,6 +133,10 @@ class RuntimeState:
     async def wait_mapping_ready(self) -> bool:
         """Block until a device mapping exists. False if shutdown came first."""
         return await self._wait_for(self.mapping_ready)
+
+    async def wait_credentials(self) -> bool:
+        """Block until an operator has entered some. False if shutdown first."""
+        return await self._wait_for(self.credentials_ready)
 
     async def set_ws_connected(self, connected: bool) -> None:
         async with self._ws_lock:
@@ -438,15 +461,51 @@ class RuntimeState:
         tag, text = split_tag(message)
         get_logger(tag).log(level, text)
 
-    async def echo(self, text: str = "") -> None:
+    async def write(self, text: str = "") -> None:
         """
-        Write straight to the terminal, creating no log record.
+        Write straight to the terminal, creating no log record and never
+        captured.
 
-        Used for output that must not be logged — showing the log file through
-        state.log() would append what you are reading back into the file.
+        Frames drawn by the mock display come through here: they are what the
+        operator is meant to be reading, so they must not end up in the buffer
+        that feeds the panel.
         """
         async with self.print_lock:
             await asyncio.to_thread(print, text)
+
+    async def echo(self, text: str = "") -> None:
+        """
+        Menu output, to the terminal or to the panel.
+
+        Creates no log record: showing the log file through state.log() would
+        append what you are reading back into the file. With a display fitted
+        the menu captures these lines and pages them onto it instead of
+        printing them, so they are not also duplicated into the journal.
+        """
+        if self._echo_sink is not None:
+            self._echo_sink.extend(str(text).split("\n"))
+            return
+        await self.write(text)
+
+    # -- echo capture (see _echo_sink) ---------------------------------------
+
+    def capture_echo(self) -> None:
+        """Start collecting echo() output instead of printing it."""
+        if self._echo_sink is None:
+            self._echo_sink = []
+
+    def take_echo(self) -> list[str]:
+        """Everything echoed since the last take. Capture stays on."""
+        if self._echo_sink is None:
+            return []
+        lines, self._echo_sink = self._echo_sink, []
+        return lines
+
+    def stop_echo_capture(self) -> list[str]:
+        """Stop collecting and hand back whatever had not been taken."""
+        lines = self.take_echo()
+        self._echo_sink = None
+        return lines
 
     async def update_readings(
         self,

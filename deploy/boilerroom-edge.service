@@ -25,10 +25,18 @@ ExecStart=/usr/bin/python3 /home/pi/boilerRoom-edge/src/main.py
 # GPIO, SPI and 1-Wire access without running as root.
 SupplementaryGroups=gpio spi i2c
 
-# No terminal under systemd: the control menu would read EOF on stdin, treat it
-# as "operator chose quit", and exit immediately — a restart loop. Setting this
-# explicitly rather than relying on the isatty() check.
-Environment=BOILERROOM_MENU=off
+# No terminal under systemd. Which of the two that means depends on the build:
+#
+#   * on the installed device the menu is answered on the matrix keypad and
+#     shown on the ST7920 panel, neither of which is a TTY, and disabling it
+#     here would leave the operator no way to touch the boilers by hand
+#   * on a mock build the menu is answered from a keyboard that is not there,
+#     where it would read EOF on stdin, treat it as "operator chose quit", and
+#     exit into a restart loop
+#
+# The isatty() check in menu_enabled() already tells those apart — the keypad
+# declares that it needs no terminal, the keyboard declares that it does — so
+# there is no override here. Set BOILERROOM_MENU=off to force it off anyway.
 StandardInput=null
 
 # The agent writes its own rotating log to data/boilerroom.log. Only the

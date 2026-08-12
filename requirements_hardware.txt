@@ -1,0 +1,38 @@
+# Extra packages for the installed device — USE_MOCK_HARDWARE = False.
+#
+#     pip install -r requirements_hardware.txt
+#
+# The mock build imports none of these, which is what lets the whole agent —
+# menus, schedule, limits, telemetry — be developed and tested on a laptop that
+# has no GPIO header. Install these on the Pi only.
+#
+# On Raspberry Pi OS Bookworm and later, pip refuses to install into the system
+# Python (PEP 668) and the service runs that system Python. Both packages ship
+# as apt packages there, and are usually already present:
+#
+#     sudo apt install python3-rpi.gpio python3-spidev
+#
+# Use pip in a virtualenv, or apt for the system Python — but whichever the
+# service's ExecStart points at is the one that needs them. deploy/install.sh
+# takes the python3 on PATH at install time.
+
+-r requirements.txt
+
+# GPIO. Drives the relay board (relay_controller.py) and scans the matrix
+# keypad (keypad.py).
+#
+# This is the library for the Pi 1-4 and Zero, which is the target here. It
+# cannot reach the Pi 5's GPIO block at all; rpi-lgpio is the drop-in
+# replacement if this ever moves to one.
+RPi.GPIO>=0.7.1
+
+# SPI. Reads the gas ADC on CE0 (gas_reader.py) and drives the ST7920 display
+# on CE1 (display.py). Separate chip selects on one bus, one handle each.
+spidev>=3.5
+
+# Not packages, but hardware mode needs them too — see README:
+#   * SPI enabled            raspi-config, or dtparam=spi=on
+#   * 1-Wire enabled         dtoverlay=w1-gpio (the temperature probes are read
+#                            from /sys/bus/w1/devices, so they need no package)
+#   * gpio and spi groups    the service runs unprivileged; deploy/install.sh
+#                            adds whichever of them exist on the host
