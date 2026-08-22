@@ -72,8 +72,8 @@ _log = get_logger("keypad")
 
 # Connector pin -> BCM GPIO. Chosen to avoid the relay pins (18, 23, 24, 25,
 # 12, 16, 20, 21), the 1-Wire bus (4) and the SPI pins the gas ADC uses.
-DEFAULT_ROW_GPIO = (17, 27, 22, 5)  # connector A, B, C, D
-DEFAULT_COL_GPIO = (6, 13, 19, 26)  # connector 1, 2, 3, 4
+DEFAULT_ROW_GPIO = (11, 13, 15, 29)  # connector 1, 2, 3, 4
+DEFAULT_COL_GPIO = (31, 33, 35, 37)  # connector 5, 6, 7, 8
 
 # Names the connector uses, for messages during bring-up.
 ROW_LABELS = ("A", "B", "C", "D")

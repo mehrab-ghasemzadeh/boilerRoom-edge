@@ -18,16 +18,29 @@ SPI_DEVICE = 0
 SPI_SPEED = 1_000_000
 
 # BCM pins the gas ADC occupies: MOSI, SCLK, CE0.
+# NOTE: GPIO 11 (SCLK) is also used by the keypad — a hardware conflict if
+# both are active. The keypad takes precedence; the gas ADC must not be used
+# on this wiring, or the keypad must move off GPIO 11.
 SPI_GPIO = (10, 11, 8)
 
-# ST7920 128x64 graphical display. Same SPI bus as the gas ADC, its own chip
-# select — the kernel serialises the two, and each opens its own handle because
-# they run at different clocks and in different SPI modes.
+# ST7920 128x64 graphical LCD.
+#
+# Wired in parallel mode (PSB tied to GND):
+#   RS -> GPIO 24, R/W -> GPIO 19, E -> GPIO 23
+#   PSB -> GPIO 6 (GND), GND -> GPIO 9, VCC -> GPIO 2
+#
+# The current display.py only supports SPI mode. A parallel-mode driver is
+# needed for this wiring, or rewire the panel to SPI (PSB to VCC, connect
+# SID/CLK/CS).
+#
+# DISPLAY_GPIO below documents the SPI-mode pins for conflict detection.
+# They are not used while the panel is in parallel mode.
 DISPLAY_SPI_BUS = 0
 DISPLAY_SPI_DEVICE = 1  # CE1
 DISPLAY_SPI_SPEED = 800_000
 
-# BCM pins the panel occupies: SID -> MOSI, CLK -> SCLK, CS -> CE1.
+# BCM pins the panel occupies in SPI mode: SID -> MOSI, CLK -> SCLK, CS -> CE1.
+# In parallel mode these are not used; the actual pins are RS=24, R/W=19, E=23.
 DISPLAY_GPIO = (10, 11, 7)
 
 # Populated by load_device_mapping() at startup
