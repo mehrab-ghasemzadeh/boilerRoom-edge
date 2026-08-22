@@ -66,6 +66,7 @@ class Keypad:
     """The control menu's input device, backed by the GPIO matrix."""
 
     name = "GPIO matrix keypad"
+    needs_tty = False
     # The keypad is the terminal. Without this the menu would be disabled under
     # systemd, where there is no TTY — which is exactly where the keypad is the
     # only way in.
