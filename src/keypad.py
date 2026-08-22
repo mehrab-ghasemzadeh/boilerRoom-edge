@@ -109,7 +109,13 @@ class Keypad:
         says: driving a row pin that is also SPI clock does not just break the
         keypad, it takes the gas ADC and the display down with it.
         """
-        from config import DISPLAY_GPIO, ONE_WIRE_GPIO, RELAYS, SPI_GPIO
+        from config import (
+            DISPLAY_GPIO,
+            DISPLAY_PARALLEL_GPIO,
+            ONE_WIRE_GPIO,
+            RELAYS,
+            SPI_GPIO,
+        )
 
         mine = set(self._rows) | set(self._cols)
         clashes: dict[int, str] = {}
@@ -128,6 +134,9 @@ class Keypad:
         for pin in DISPLAY_GPIO:
             if pin in mine:
                 clashes[pin] = "the SPI bus the display uses"
+        for pin in DISPLAY_PARALLEL_GPIO:
+            if pin in mine:
+                clashes[pin] = "the parallel-mode LCD control pins"
 
         return clashes
 

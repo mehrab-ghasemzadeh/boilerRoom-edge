@@ -26,15 +26,12 @@ SPI_GPIO = (10, 11, 8)
 # ST7920 128x64 graphical LCD.
 #
 # Wired in parallel mode (PSB tied to GND):
-#   RS -> GPIO 24, R/W -> GPIO 19, E -> GPIO 23
 #   PSB -> GPIO 6 (GND), GND -> GPIO 9, VCC -> GPIO 2
+#   RS  -> GPIO 24, R/W -> GPIO 19, E -> GPIO 23
 #
 # The current display.py only supports SPI mode. A parallel-mode driver is
 # needed for this wiring, or rewire the panel to SPI (PSB to VCC, connect
 # SID/CLK/CS).
-#
-# DISPLAY_GPIO below documents the SPI-mode pins for conflict detection.
-# They are not used while the panel is in parallel mode.
 DISPLAY_SPI_BUS = 0
 DISPLAY_SPI_DEVICE = 1  # CE1
 DISPLAY_SPI_SPEED = 800_000
@@ -42,6 +39,9 @@ DISPLAY_SPI_SPEED = 800_000
 # BCM pins the panel occupies in SPI mode: SID -> MOSI, CLK -> SCLK, CS -> CE1.
 # In parallel mode these are not used; the actual pins are RS=24, R/W=19, E=23.
 DISPLAY_GPIO = (10, 11, 7)
+
+# Parallel-mode control pins for conflict detection when PSB is tied LOW.
+DISPLAY_PARALLEL_GPIO = (24, 19, 23, 6)
 
 # Populated by load_device_mapping() at startup
 UNITS: dict[str, dict[str, str]] = {}
