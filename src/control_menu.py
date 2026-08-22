@@ -2047,7 +2047,7 @@ async def run_control_menu(state: RuntimeState) -> None:
     set_input_device(device)
     view = await _start_screen(state, device)
 
-    if not menu_enabled(device):
+    if not menu_enabled(device) and not _credentials_wanted(state):
         await state.log(
             "[menu] No terminal attached — control menu disabled "
             "(set BOILERROOM_MENU=on to force it)"
