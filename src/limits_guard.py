@@ -25,11 +25,10 @@ reaching it, restore at ``min_water_temperature_c``, or one fallback deadband
 below the maximum when the server sends no minimum.
 
 **One probe on the unit.** A single probe cannot tell flow from return, so it
-reads as the boiler's own temperature and the configured value is the *target*
-it is held at: cut one band above, restore the same band below.
-``BOILERROOM_SINGLE_PROBE_BAND`` sets the band (3 °C). Note what this means —
-such a boiler is allowed to run up to one band *above*
-``max_water_temperature_c`` before it is cut.
+reads as the boiler's own temperature. The configured value is a *ceiling*: cut
+on reaching ``max_water_temperature_c``, restore ``BOILERROOM_SINGLE_PROBE_BAND``
+below it (3 °C). This keeps the boiler from ever exceeding the configured
+maximum, while the deadband prevents rapid on/off cycling around the setpoint.
 
 The topology is read from the **mapping**, never from which probes happen to be
 readable this cycle. Deciding it from live readings would let a failed outlet
@@ -210,9 +209,10 @@ def _thresholds(
         return None, None
 
     if single_probe:
-        # One probe reads as the boiler's own temperature, so the target is the
-        # value it is held at rather than a ceiling.
-        return target + SINGLE_PROBE_BAND_C, target - SINGLE_PROBE_BAND_C
+        # One probe reads as the boiler's own temperature, so the configured
+        # maximum is a hard ceiling: cut on reaching it, restore one band below
+        # to avoid rapid cycling.
+        return target, target - SINGLE_PROBE_BAND_C
 
     if setpoint is not None:
         # A per-unit setpoint has no matching per-unit minimum, so recovery
@@ -392,7 +392,7 @@ class LimitGuard:
         if water_over and water is not None and cut_at is not None:
             reason = REASON_WATER
             detail = f"boiler {water:.1f} °C >= cut-out {cut_at:.1f} °C" + (
-                f" (single probe, target +{SINGLE_PROBE_BAND_C:.0f} °C)"
+                f" (single probe, restore -{SINGLE_PROBE_BAND_C:.0f} °C)"
                 if single_probe
                 else ""
             )
@@ -512,7 +512,7 @@ class LimitGuard:
                         f"{restore_at:.1f} °C" if restore_at is not None else "—"
                     )
                     if single_probe:
-                        band += f"  [single probe, ±{SINGLE_PROBE_BAND_C:.0f} °C]"
+                        band += f"  [single probe, restore -{SINGLE_PROBE_BAND_C:.0f} °C]"
 
             record = self._cut.get(target)
             status = (

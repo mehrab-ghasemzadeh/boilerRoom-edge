@@ -82,7 +82,8 @@ USE_MOCK_HARDWARE = _use_mock_hardware()
 #
 # This also sets how quickly the over-temperature cut can react — see the
 # limit-latency note in the README.
-DEFAULT_READ_INTERVAL = 60
+DEFAULT_READ_INTERVAL = 10
+DEFAULT_WRITE_INTERVAL = 60
 
 # How often to re-check the active schedule for a state transition
 SCHEDULE_TICK_SECONDS = 20
@@ -198,7 +199,10 @@ async def sensor_loop(state: RuntimeState) -> None:
             temperatures = apply_calibration(temperatures)
 
             await state.update_readings(temperatures, gas)
-            await save_readings(temperatures, gas)
+
+            if await state.write_due():
+                await save_readings(temperatures, gas)
+                await state.mark_write_done()
 
             await error_reporter.check_temperature_faults(
                 temperatures,
@@ -656,7 +660,7 @@ def install_signal_handlers(state: RuntimeState) -> None:
 
 async def main() -> None:
     configure_logging()
-    state = RuntimeState(read_interval=DEFAULT_READ_INTERVAL)
+    state = RuntimeState(read_interval=DEFAULT_READ_INTERVAL, write_interval=DEFAULT_WRITE_INTERVAL)
     install_signal_handlers(state)
 
     # Said out loud on every boot, because it is the one setting whose being

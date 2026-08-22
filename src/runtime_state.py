@@ -20,27 +20,15 @@ TELEMETRY_DUE_SLACK_SECONDS = 5.0
 
 
 class RuntimeState:
-    def __init__(self, read_interval: float = 10.0):
+    def __init__(self, read_interval: float = 10.0, write_interval: float = 60.0):
         self.shutdown = asyncio.Event()
-        # Set once a device session exists. Until then the agent runs offline
-        # from its cached schedule; telemetry and the WebSocket wait for it.
         self.authenticated = asyncio.Event()
-        # The two halves of asking an operator for the device's credentials.
-        # The auth task cannot ask — it has no screen — and the control menu
-        # cannot log in, so they pass it between them: auth raises its hand
-        # with ``credentials_needed``, the menu answers with
-        # ``credentials_ready``, and auth reports back by setting
-        # ``authenticated`` or raising its hand again.
         self.credentials_needed = asyncio.Event()
         self.credentials_ready = asyncio.Event()
-
-        # Set once a usable device mapping exists. The wiring comes from the
-        # server record, so a device that has never been paired has nothing to
-        # drive until one arrives — the sensor loop waits on this rather than
-        # building hardware it cannot address.
         self.mapping_ready = asyncio.Event()
         self.print_lock = asyncio.Lock()
         self.read_interval = read_interval
+        self.write_interval = write_interval
 
         self._data_lock = asyncio.Lock()
         self._last_temperatures: dict[int, float | None] = {}
@@ -108,6 +96,11 @@ class RuntimeState:
         # without this a local change would wait out the whole interval.
         self.state_changed = asyncio.Event()
         self._state_change_reasons: list[str] = []
+
+        # Database write pacing. Readings are read every ``read_interval`` but
+        # only persisted every ``write_interval`` so the sensor loop can react
+        # to limits quickly without hammering the SD card.
+        self._last_write_at: float | None = None
 
     async def _wait_for(self, event: asyncio.Event) -> bool:
         """Block until an event fires. Returns False if shutdown came first."""
@@ -435,6 +428,17 @@ class RuntimeState:
             reasons = list(self._state_change_reasons)
             self._state_change_reasons.clear()
         return reasons
+
+    # -- database write pacing ------------------------------------------------
+
+    async def write_due(self) -> bool:
+        """Whether the database write interval has elapsed since the last save."""
+        if self._last_write_at is None:
+            return True
+        return time.monotonic() - self._last_write_at >= self.write_interval
+
+    async def mark_write_done(self) -> None:
+        self._last_write_at = time.monotonic()
 
     async def get_ws_status(self) -> dict[str, Any]:
         async with self._ws_lock:
